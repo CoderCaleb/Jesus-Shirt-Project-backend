@@ -2,3 +2,5 @@ Flask
 Gunicorn
 stripe
 Flask-Cors
+requests
+pymongo
