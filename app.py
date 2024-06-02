@@ -12,6 +12,8 @@ from firebase_admin import auth as firebase_auth
 import time
 import secrets
 import hashlib
+import random
+import string
 
 cred = firebase_admin.credentials.Certificate('jesus-shirt-project-firebase-adminsdk-o18sq-9eb6ed6989.json')
 firebase_admin.initialize_app(cred)
@@ -32,7 +34,8 @@ shopDB = client["shop"]
 productsCollection = shopDB["products"]
 ordersCollection = shopDB["orders"]
 usersCollection = shopDB["users"]
-
+errorDB = client["errors"]
+orderErrorsCollection = errorDB["orderErrors"]
 
 class JSONEncoder(json.JSONEncoder):
     def default(self, o):
@@ -48,6 +51,45 @@ def calculate_order_amount(items):
     total_price += 2
     return int(total_price*100)
 
+def generate_unique_suffix(length=8):
+    # Generate a unique suffix using random letters
+    return ''.join(random.choices(string.ascii_uppercase, k=length))
+
+def generate_sequential_order_number(last_order_number):
+    print("Last order number:", last_order_number)
+    
+    if not last_order_number:
+        return "ORD00001" + generate_unique_suffix()
+
+    # Extract the numeric part by removing non-digit characters
+    numeric_part = int(''.join(filter(str.isdigit, last_order_number)))
+
+    # Increment the numeric part to get the next order number
+    next_numeric_part = numeric_part + 1
+
+    # Combine the prefix "ORD" with the incremented numeric part, formatted to 5 digits
+    next_order_number = "ORD" + str(next_numeric_part).zfill(5) + generate_unique_suffix()
+
+    return next_order_number
+
+def generate_sequential_error_number(last_error_number):
+    print("Last error number:", last_error_number)
+    
+    if not last_error_number:
+        return "ERR00001" + generate_unique_suffix()
+
+    # Extract the numeric part by removing non-digit characters
+    numeric_part = int(''.join(filter(str.isdigit, last_error_number)))
+
+    # Increment the numeric part to get the next error number
+    next_numeric_part = numeric_part + 1
+
+    # Combine the prefix "ERR" with the incremented numeric part, formatted to 5 digits
+    next_error_number = "ERR" + str(next_numeric_part).zfill(5) + generate_unique_suffix()
+
+    return next_error_number
+
+
 def authenticate_firebase_token(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -55,11 +97,12 @@ def authenticate_firebase_token(f):
         request.user = None        
         if id_token and id_token.startswith('Bearer '):
             id_token = id_token.split('Bearer ')[1]
+            print("ID TOKEN:", id_token)
         
             try:
                 decoded_token = firebase_auth.verify_id_token(id_token)
                 request.user = decoded_token
-                print(request)
+                print(request.user)
                 
                 data = json.loads(request.data)
 
@@ -83,6 +126,10 @@ def get_user_data(uid, projection):
 def get_order_data(orderId, projection):
     orderData = ordersCollection.find_one({"order_number": orderId}, projection)
     return orderData
+
+def get_order_error_data(errorId, projection):
+    errorData = orderErrorsCollection.find_one({"error_number":errorId}, projection)
+    return errorData
 
 def generate_token(orderId):
     order_id_bytes = str(orderId).encode("utf-8")
@@ -195,23 +242,107 @@ def update_payment_intent():
 @app.route("/place-order",methods=["POST"])
 @authenticate_firebase_token
 def place_order():
+    data = json.loads(request.data)
+    orderData = data.get("orderData")
     try:
-        data = json.loads(request.data)
-        orderData = data.get("orderData")
-        print('Request:',request)
+        if not orderData:
+            raise ValueError("orderData is required")
+
         user = request.user
-        if orderData["linked_user"]:
-            if not user and orderData["linked_user"] != user["uid"]:
-                orderData["linked_user"] = None
-                
-        token = generate_token(orderData["order_number"])
-        orderData["order_token"] = token
-        result = ordersCollection.insert_one(orderData)
-        orderId = str(result.inserted_id)
-        return jsonify({'message': 'Order placed successfully','orderId':orderId}), 200
+
+        def callback(session):
+            latestOrder = ordersCollection.aggregate(
+                [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "maxOrderNumber": {"$max": "$order_number"},
+                        }
+                    }
+                ],
+                session=session,
+            )
+            latestOrder = list(latestOrder)
+            latestOrderNumber = (
+                latestOrder[0]["maxOrderNumber"] if latestOrder else None
+            )
+            print(latestOrder)
+
+            if orderData.get("linked_user"):
+                if not user or orderData["linked_user"] != user["uid"]:
+                    orderData["linked_user"] = None
+
+            newOrderNumber = generate_sequential_order_number(latestOrderNumber)
+            orderData["order_number"] = newOrderNumber
+            orderData["_id"] = newOrderNumber
+
+            token = generate_token(newOrderNumber)
+            orderData["order_token"] = token
+
+            order_insert_result = ordersCollection.insert_one(orderData, session=session)
+            if not order_insert_result.acknowledged:
+                raise Exception("Failed to add order to ordersCollection")
+
+            orderId = str(order_insert_result.inserted_id)
+
+            if user:
+                add_order_to_user_result = usersCollection.update_one(
+                    {"uid": user["uid"]},
+                    {"$push": {"orders": orderId}},
+                    session=session,
+                )
+                if not add_order_to_user_result.acknowledged:
+                    raise Exception("Failed to add order to user")
+            raise Exception("Failed to add order to user")
+
+            print(orderData)
+            stripe.PaymentIntent.modify(
+                orderData["payment_id"], metadata={"order_id": orderId}
+            )
+            return {
+                "message": "Order placed successfully",
+                "orderData": {
+                    "orderNumber": orderId,
+                    "address": orderData["shipping_address"],
+                    "orderItems": orderData["order_items"],
+                    "customer": orderData["customer"],
+                },
+            }
+
+        with client.start_session() as session:
+            result = session.with_transaction(callback)
+            print(result)
+            return jsonify({"orderResult": result}), 200
+
     except Exception as e:
         print(e)
-        return jsonify({'error': str(e)}), 500
+        try:
+            with client.start_session() as session:
+                latestError = orderErrorsCollection.aggregate(
+                    [{"$group": {"_id": None, "maxErrorNumber": {"$max": "$error_number"}}}],
+                    session=session,
+                )
+                latestError = list(latestError)
+                latestErrorNumber = latestError[0]["maxErrorNumber"] if latestError else None
+                newErrorNumber = generate_sequential_error_number(latestErrorNumber)
+                orderData["_id"] = newErrorNumber
+                orderData["error_number"] = newErrorNumber
+                token = generate_token(newErrorNumber)
+                orderData["order_token"] = token
+                order_error_insert_result = orderErrorsCollection.insert_one(orderData, session=session)
+                order_error_id = str(order_error_insert_result.inserted_id)
+                stripe.PaymentIntent.modify(
+                    orderData["payment_id"],
+                    metadata={
+                        "error_number": order_error_id,
+                        "issue": "order_transaction_failed",
+                    },
+                )
+                return jsonify({"error": str(e), "order_error_id": order_error_id}), 500
+        except Exception as log_error:
+            print(log_error)
+            return jsonify({"error": str(e), "additional_error": str(log_error)}), 500
+
 @app.route("/get-orders-summary",methods=["POST"])  
 @authenticate_firebase_token  
 def get_orders_summary():
@@ -234,6 +365,24 @@ def get_orders_summary():
     except Exception as e:
         print(e)
         return jsonify({'error': str(e)}), 500  
+
+@app.route("/get-order-error")
+def get_order_error():
+    try:
+        order_error_id = request.args.get("order-error-id")
+        print("order error id",order_error_id)
+        if not order_error_id:
+            return jsonify({"error":"Order Error ID not provided"}), 400
+        projection = {"order_items":1,"shipping_cost":1}
+        errorData = get_order_error_data(order_error_id,projection)
+        print("errorData:",errorData)
+        if not errorData:
+            return jsonify({"error":"Order error not found"}), 404
+        else:
+            return jsonify({"orderErrorInfo":errorData}), 200
+    except Exception as e:
+        print(e)
+        return jsonify({'error': str(e)}), 500    
         
 @app.route("/get-order",methods=["POST"])
 @authenticate_firebase_token
@@ -314,16 +463,16 @@ def add_order_to_user():
 @authenticate_firebase_token
 def add_user():
     user = request.user
-
+    data = json.loads(request.data)
+    uid = data.get("uid")
+    name = data.get("name")
+    email = data.get("email")
+    birthday = data.get("birthday")
+    clothingPreference = data.get("clothingPreference")
     if not user:
+        firebase_auth.delete_user(user.uid)
         return jsonify({"error":"User not authorized"}), 401
     try:
-        data = json.loads(request.data)
-        uid = data.get("uid")
-        name = data.get("name")
-        email = data.get("email")
-        birthday = data.get("birthday")
-        clothingPreference = data.get("clothingPreference")
         usersCollection.insert_one({
             "uid":uid, 
             "name":name, 
@@ -333,6 +482,7 @@ def add_user():
         })
         return jsonify({'message': 'Added user successfully'}), 200
     except Exception as e:
+        firebase_auth.delete_user(user.uid)
         return jsonify({'error': str(e)}), 500
 @app.route("/get-user",methods=["POST"])
 @authenticate_firebase_token
