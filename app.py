@@ -94,6 +94,8 @@ def authenticate_firebase_token(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         id_token = request.headers.get('Authorization')
+        uid = request.args.get("uid") or request.json.get("uid")
+        print("uid from auth:",uid)
         request.user = None        
         if id_token and id_token.startswith('Bearer '):
             id_token = id_token.split('Bearer ')[1]
@@ -103,17 +105,16 @@ def authenticate_firebase_token(f):
                 decoded_token = firebase_auth.verify_id_token(id_token)
                 request.user = decoded_token
                 print(request.user)
-                
-                data = json.loads(request.data)
-
-                uid = data.get("uid")
-                
+                                
                 if not uid:
                     return jsonify({"error":"No UID was provided"}), 400
 
                 if uid != decoded_token["uid"]:
                     return jsonify({'error': 'UID mismatch'}), 401
             except Exception as e:
+                if request.url_rule.rule == '/add-user':  # Adjust this condition based on your routing setup
+                    firebase_auth.delete_user(uid)
+
                 return jsonify({'error': 'Unauthorized: Invalid token'}), 401
         
         return f(*args, **kwargs)
@@ -141,17 +142,33 @@ def generate_token(orderId):
     
 
 @app.route('/create-payment-intent', methods=['POST'])
+@authenticate_firebase_token
 def create_payment():
     try:
         data = json.loads(request.data)
         # Create a PaymentIntent with the order amount and currency
+        user_id = None
+        user = request.user
+        print("/create-payment-intent:",user)
+
+        if not user:
+            user_id = None
+        else:
+            user_id = user["uid"]   
+        checkoutItems = data.get("checkoutItems",None)
+        shortenedCheckoutItems = [{"id":item["id"], "quantity":item["quantity"], "size":item["size"]} for item in checkoutItems]
+        if isinstance(shortenedCheckoutItems, str) and len(shortenedCheckoutItems) > 500:
+            return jsonify({"error":"Too much order items"})
+        print(shortenedCheckoutItems)
+        if user_id == "None":
+            user_id == None
         intent = stripe.PaymentIntent.create(
-            amount=calculate_order_amount(data["checkoutItems"]),
+            amount=calculate_order_amount(checkoutItems),
             currency='sgd',
-            # In the latest version of the API, specifying the `automatic_payment_methods` parameter is optional because Stripe enables its functionality by default.
-            automatic_payment_methods={
-                'enabled': True,
-            },
+            metadata={
+                "order_items": json.dumps(shortenedCheckoutItems),
+                "user_id": user_id
+            }
         )
         # Return the client secret and PaymentIntent ID in the response
         return jsonify({
@@ -159,14 +176,14 @@ def create_payment():
             'id': intent['id']
         })
     except Exception as e:
+        print(e)
         return jsonify(error=str(e)), 403
 
-@app.route('/fetch_product', methods=['POST'])
+@app.route('/fetch_product')
 def handle_fetch_product():
     # Parse the JSON data from the request
     try:
-        data = json.loads(request.data)
-        product_id = data.get('id')
+        product_id = request.args.get('productID')
         
         if product_id is None:
             return jsonify({'error': 'Product ID is required in the request data'}), 400
@@ -184,8 +201,9 @@ def handle_fetch_product():
     
 @app.route('/get_store-products', methods=['GET'])
 def get_products():
+    projection = {"_id":0, "id":1, "name":1, "price":1,"thumbnail":1}
     try:
-        all_products = list(productsCollection.find())
+        all_products = list(productsCollection.find({},projection))
         all_products = JSONEncoder().encode(all_products)
 
         result = {
@@ -216,7 +234,7 @@ def get_latest_order():
             return jsonify({'error': 'No orders found'}), 404
     except Exception as e:  # Catching generic exceptions
         return jsonify({'error': str(e)}), 500
-@app.route("/update-payment-intent", methods=["POST"])    
+@app.route("/update-payment-intent", methods=["PUT"])    
 def update_payment_intent():
     data = json.loads(request.data)
     payment_intent_id = data.get('payment_intent_id')
@@ -240,15 +258,12 @@ def update_payment_intent():
         return jsonify({'error': str(e)}), 500
     
 @app.route("/place-order",methods=["POST"])
-@authenticate_firebase_token
 def place_order():
     data = json.loads(request.data)
     orderData = data.get("orderData")
     try:
         if not orderData:
             raise ValueError("orderData is required")
-
-        user = request.user
 
         def callback(session):
             latestOrder = ordersCollection.aggregate(
@@ -268,10 +283,6 @@ def place_order():
             )
             print(latestOrder)
 
-            if orderData.get("linked_user"):
-                if not user or orderData["linked_user"] != user["uid"]:
-                    orderData["linked_user"] = None
-
             newOrderNumber = generate_sequential_order_number(latestOrderNumber)
             orderData["order_number"] = newOrderNumber
             orderData["_id"] = newOrderNumber
@@ -285,20 +296,25 @@ def place_order():
 
             orderId = str(order_insert_result.inserted_id)
 
-            if user:
+            if orderData["linked_user"]:
                 add_order_to_user_result = usersCollection.update_one(
-                    {"uid": user["uid"]},
+                    {"uid": orderData["linked_user"]},
                     {"$push": {"orders": orderId}},
                     session=session,
                 )
                 if not add_order_to_user_result.acknowledged:
                     raise Exception("Failed to add order to user")
-            raise Exception("Failed to add order to user")
-
+            payment_intent = stripe.PaymentIntent.retrieve(
+                    orderData["payment_id"],
+                )
+            metadata = payment_intent["metadata"]
+            metadata["order_id"] = orderId
             print(orderData)
             stripe.PaymentIntent.modify(
-                orderData["payment_id"], metadata={"order_id": orderId}
+                orderData["payment_id"], metadata=metadata
             )
+            raise Exception("Failed to add order to ordersCollection")
+
             return {
                 "message": "Order placed successfully",
                 "orderData": {
@@ -317,11 +333,11 @@ def place_order():
     except Exception as e:
         print(e)
         try:
-            with client.start_session() as session:
+            def callback(session):
                 latestError = orderErrorsCollection.aggregate(
-                    [{"$group": {"_id": None, "maxErrorNumber": {"$max": "$error_number"}}}],
-                    session=session,
-                )
+                        [{"$group": {"_id": None, "maxErrorNumber": {"$max": "$error_number"}}}],
+                        session=session,
+                    )
                 latestError = list(latestError)
                 latestErrorNumber = latestError[0]["maxErrorNumber"] if latestError else None
                 newErrorNumber = generate_sequential_error_number(latestErrorNumber)
@@ -331,19 +347,27 @@ def place_order():
                 orderData["order_token"] = token
                 order_error_insert_result = orderErrorsCollection.insert_one(orderData, session=session)
                 order_error_id = str(order_error_insert_result.inserted_id)
+                payment_intent = stripe.PaymentIntent.retrieve(
+                    orderData["payment_id"],
+                )
+                metadata = payment_intent["metadata"]
+                metadata["error_number"] = order_error_id
+                metadata["issue"] = "order_transaction_failed"
                 stripe.PaymentIntent.modify(
                     orderData["payment_id"],
-                    metadata={
-                        "error_number": order_error_id,
-                        "issue": "order_transaction_failed",
-                    },
+                    metadata=metadata
                 )
                 return jsonify({"error": str(e), "order_error_id": order_error_id}), 500
+
+            with client.start_session() as session:
+                result = session.with_transaction(callback)
+                return jsonify({"errorResult": result}), 200
+
         except Exception as log_error:
             print(log_error)
             return jsonify({"error": str(e), "additional_error": str(log_error)}), 500
 
-@app.route("/get-orders-summary",methods=["POST"])  
+@app.route("/get-orders-summary")  
 @authenticate_firebase_token  
 def get_orders_summary():
     try:
@@ -384,7 +408,7 @@ def get_order_error():
         print(e)
         return jsonify({'error': str(e)}), 500    
         
-@app.route("/get-order",methods=["POST"])
+@app.route("/get-order")
 @authenticate_firebase_token
 def get_order():
     try:
@@ -392,15 +416,13 @@ def get_order():
 
         if not user:
             return jsonify({"error":"User not authorized"}), 401
-        data = json.loads(request.data)
-        orderNumber = data.get("orderNumber")
-        userUid = data.get("uid")
+        orderNumber = request.args.get("orderNumber")
         projection = {"orders": 1, "_id": 0}
 
-        if not orderNumber or not userUid:
-            return jsonify({'error': 'orderNumber and userUid are required'}), 400
+        if not orderNumber or not user["uid"]:
+            return jsonify({'error': 'orderNumber and user["uid"] are required'}), 400
 
-        userData = get_user_data(userUid, projection)
+        userData = get_user_data(user["uid"], projection)
 
         if isinstance(userData, dict):
             userOrders = userData['orders']
@@ -426,20 +448,7 @@ def get_order():
     except Exception as e:
         print(e)
         return jsonify({'error': str(e)}), 500
-@app.route("/get-payment-data",methods=["POST"])
-@authenticate_firebase_token
-def get_payment_data():
-    try:
-        user = request.user
 
-        if not user:
-            return jsonify({"error":"User not authorized"}), 401
-        data = json.loads(request.data)
-        payment_method_id = data.get("payment_method_id")
-        payment_method_data = stripe.PaymentMethod.retrieve(payment_method_id)
-        return jsonify({"paymentData": payment_method_data}), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 @app.route("/add-order-to-user",methods=["POST"])
 @authenticate_firebase_token
 def add_order_to_user():
@@ -470,7 +479,6 @@ def add_user():
     birthday = data.get("birthday")
     clothingPreference = data.get("clothingPreference")
     if not user:
-        firebase_auth.delete_user(user.uid)
         return jsonify({"error":"User not authorized"}), 401
     try:
         usersCollection.insert_one({
@@ -482,9 +490,9 @@ def add_user():
         })
         return jsonify({'message': 'Added user successfully'}), 200
     except Exception as e:
-        firebase_auth.delete_user(user.uid)
+        firebase_auth.delete_user(uid)
         return jsonify({'error': str(e)}), 500
-@app.route("/get-user",methods=["POST"])
+@app.route("/get-user")
 @authenticate_firebase_token
 def get_user():
     user = request.user
@@ -492,12 +500,10 @@ def get_user():
     if not user:
         return jsonify({"error":"User not authorized"}), 401
     try:
-        data = json.loads(request.data)
-        uid = data.get("uid")
         user = request.user
         projection = None
         
-        userData = get_user_data(uid, projection)
+        userData = get_user_data(user["uid"], projection)
         userData = JSONEncoder().encode(userData)
         
         if userData:
@@ -508,6 +514,126 @@ def get_user():
         return jsonify({'error': 'Invalid JSON data'}), 400
     except Exception as e:
         print(e)
-        return jsonify({'error': str(e)}), 500      
+        return jsonify({'error': str(e)}), 500  
+def handle_payment_intent_succeeded(payment_intent):
+    print("PI metadata:",payment_intent['metadata'])
+    order_data = {
+        "customer": {
+            "emailAddress": payment_intent['receipt_email'],
+            "name": payment_intent['shipping']['name'],
+        },
+        "status": "printing",
+        "order_items": payment_intent['metadata'].get('order_items', None),  # Fill this with actual order items if needed
+        "total_price": payment_intent['amount'],
+        "payment_id": payment_intent['id'],
+        "shipping_address": payment_intent['shipping']['address'],
+        "shipping_cost": 3.5,
+        "payment_method": payment_intent['payment_method'],
+        "order_date": payment_intent['created'],
+        "linked_user": payment_intent['metadata'].get('user_id', None),
+    }
+    try:
+        response = requests.post("http://127.0.0.1:4242/place-order",json={
+            "orderData": order_data,
+            "uid": order_data["linked_user"]
+        })
+        if response.status_code != 200:
+            print("Failed to place order.")
+            return {"error":"Failed to place order."}
+        print("Order placed successfully")
+        return {"success":"Order placed successfully"}
+    
+    except requests.RequestException as e:
+        print(f"HTTP request failed: {e}")
+        return {"error": "HTTP request failed"}
+    
+endpoint_secret = "whsec_10e8fd7fe0294f3ad3ec08186ec0ab93be59a9e646ff25b2ce1db8fe97039948"
+@app.route("/stripe_webhook", methods=["POST"])
+def stripe_webhook():
+    payload = request.get_data(as_text=True)
+    sig_header = request.headers.get("Stripe-Signature")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, endpoint_secret
+        )
+
+    except ValueError as e:
+        # Invalid payload
+        return "Invalid payload", 400
+    except stripe.error.SignatureVerificationError as e:
+        # Invalid signature
+        return "Invalid signature", 400
+
+    # Handle the checkout.session.completed event
+    if event["type"] == "payment_intent.succeeded":
+        payment_intent = event["data"]["object"] # contains a stripe.PaymentIntent
+        res = handle_payment_intent_succeeded(payment_intent)
+        if "error" in res:
+            print("Order was successful.")
+        else:
+            print("Order was not successful")
+        
+
+    return "Success", 200   
+@app.route("/retrieve-payment-intent")
+def retrieve_payment_intent():
+    try:
+        payment_intent_id = request.args.get("payment_intent_id")
+        if not payment_intent_id:
+            return jsonify({"error":"Payment intent id not provided"}), 400
+        payment_intent = stripe.PaymentIntent.retrieve(
+                    payment_intent_id,
+        )
+        if not payment_intent:
+            return jsonify({"error":"Payment intent not found"}), 404
+        return jsonify({"paymentIntent":payment_intent}), 200
+    except Exception as e:
+        print(e)
+        return jsonify({'error': str(e)}), 500 
+
+@app.route("/get-orders", methods=["POST"])
+def get_orders():
+    data = request.get_json()  # Correctly parse the JSON data
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    order_items = data.get("order_items")
+    if isinstance(order_items, str):
+        order_items = json.loads(order_items)
+    print(order_items)
+    if not order_items:
+        return jsonify({"error": "Order items not provided"}), 400
+    
+    # Ensure order_items is a list of dictionaries
+    if not isinstance(order_items, list) or not all(isinstance(item, dict) for item in order_items):
+        return jsonify({"error": "Invalid order items format"}), 400
+    
+    # Extract the IDs from order_items
+    order_item_ids = [item["id"] for item in order_items]
+    
+    projection = {"_id": 0, "id": 1, "name": 1, "price": 1, "thumbnail": 1}
+    
+    try:
+        # Query the database with the extracted IDs
+        order_data = list(productsCollection.find({"id": {"$in": order_item_ids}}, projection))
+        
+        if not order_data:
+            return jsonify({"error": "No orders found for provided items"}), 404
+        print("Before:",order_data)
+
+        # Add quantity and size to the order_data
+        for i, item in enumerate(order_items):
+            for order_item in order_data:
+                if order_item["id"] == item["id"]:
+                    order_item["quantity"] = item["quantity"]
+                    order_item["size"] = item["size"]
+                    break  # Stop searching once the matching item is found
+        print(order_data)
+        return jsonify({"order_data": order_data}), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+            
 if __name__ == '__main__':
     app.run(port=4242, debug=True)
