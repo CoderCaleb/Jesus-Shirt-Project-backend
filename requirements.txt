@@ -4,3 +4,4 @@ stripe
 Flask-Cors
 requests
 pymongo
+firebase-admin
