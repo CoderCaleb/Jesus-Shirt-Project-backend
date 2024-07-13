@@ -16,6 +16,17 @@ import random
 import string
 import traceback
 import os
+from smtp2go.core import Smtp2goClient
+import os
+
+from dotenv import load_dotenv, dotenv_values 
+
+load_dotenv() 
+
+SMTP_API_TOKEN = os.getenv("SMTP-API-TOKEN")
+
+
+smtp2GoClient = Smtp2goClient(api_key=SMTP_API_TOKEN)
 
 cred = firebase_admin.credentials.Certificate(
     "jesus-shirt-project-firebase-adminsdk-o18sq-9eb6ed6989.json"
@@ -94,7 +105,15 @@ def get_full_order_data(order_items, projection):
     print("success,", final_order_data)
     return {"result": final_order_data}
 
-
+def handle_send_email(client, payload):
+    response = client.send(**payload)
+    if response.success: 
+        print(response.json)
+        return {"status":"success","data":response.json}
+    else:
+        print(response.errors)
+        return {"status":"error","error":response.errors}
+    
 def calculate_order_amount(items):
     projection = {"_id": 0, "price": 1, "id":1}
 
@@ -384,127 +403,141 @@ def update_payment_intent():
         return jsonify({"error": str(e)}), 500
 
 
+def update_stripe_metadata(payment_id, metadata):
+    stripe.PaymentIntent.modify(payment_id, metadata=metadata)
+
+def process_order(session, orderData):
+    latestOrder = list(ordersCollection.aggregate(
+        [
+            {
+                "$group": {
+                    "_id": None,
+                    "maxOrderNumber": {"$max": "$order_number"},
+                }
+            }
+        ],
+        session=session
+    ))
+    latestOrderNumber = latestOrder[0]["maxOrderNumber"] if latestOrder else None
+
+    newOrderNumber = generate_sequential_order_number(latestOrderNumber)
+    orderData["order_number"] = newOrderNumber
+    orderData["_id"] = newOrderNumber
+
+    token = generate_token(newOrderNumber)
+    orderData["order_token"] = token
+
+    order_insert_result = ordersCollection.insert_one(orderData, session=session)
+    if not order_insert_result.acknowledged:
+        raise Exception("Failed to add order to ordersCollection")
+
+    orderId = str(order_insert_result.inserted_id)
+
+    if orderData.get("linked_user"):
+        add_order_to_user_result = usersCollection.update_one(
+            {"uid": orderData["linked_user"]},
+            {"$push": {"orders": orderId}},
+            session=session,
+        )
+        if not add_order_to_user_result.acknowledged:
+            raise Exception("Failed to add order to user")
+
+    payment_intent = stripe.PaymentIntent.retrieve(orderData["payment_id"])
+    metadata = payment_intent["metadata"]
+    metadata.update({"order_id": orderId, "orderStatus": "success"})
+    print("metadata:",metadata)
+    update_stripe_metadata(orderData["payment_id"], metadata)
+    
+    email_payload = {
+    "sender": "tan_xuan_yi_caleb@students.edu.sg",
+    "recipients": [orderData["customer"]["emailAddress"]],
+    "template_id": "8449130",
+    "template_data": {
+        "product_name": "Christian T-Shirts",
+        "orders_url": f'http://localhost:3000/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
+        "payment": orderData["payment_id"],
+        "shipping": orderData["shipping_cost"],
+        "email": orderData["customer"]["emailAddress"],
+        "address_line_name": orderData["customer"]["name"],
+        "address_line_street": orderData["shipping_address"]["line1"],
+        "address_line_city": orderData["shipping_address"]["city"],
+        "address_line_state_country": orderData["shipping_address"]["state"] + ", " + orderData["shipping_address"]["country"],
+        "order_id": orderData["_id"],
+        "items": orderData["order_items"],
+        "total": orderData["total_price"]
+    },
+    "custom_headers": {"Your-Custom-Headers": "Custom Values"}
+}
+ 
+    emailRes = handle_send_email(smtp2GoClient, email_payload)
+    print("emailRes",emailRes)
+    if emailRes["status"] != "success":
+        raise Exception("Failed to send email to customer")
+
+    return {
+        "message": "Order placed successfully",
+        "orderData": {
+            "orderNumber": orderId,
+            "address": orderData["shipping_address"],
+            "orderItems": orderData["order_items"],
+            "customer": orderData["customer"],
+        },
+    }
+
+def handle_order_error(session, orderData, error):
+    print("handle_order_error:",error)
+    latestError = list(orderErrorsCollection.aggregate(
+        [
+            {
+                "$group": {
+                    "_id": None,
+                    "maxErrorNumber": {"$max": "$error_number"},
+                }
+            }
+        ],
+        session=session
+    ))
+    latestErrorNumber = latestError[0]["maxErrorNumber"] if latestError else None
+    newErrorNumber = generate_sequential_error_number(latestErrorNumber)
+    orderData["_id"] = newErrorNumber
+    orderData["error_number"] = newErrorNumber
+
+    token = generate_token(newErrorNumber)
+    orderData["order_token"] = token
+
+    order_error_insert_result = orderErrorsCollection.insert_one(orderData, session=session)
+    order_error_id = str(order_error_insert_result.inserted_id)
+
+    payment_intent = stripe.PaymentIntent.retrieve(orderData["payment_id"])
+    metadata = payment_intent["metadata"]
+    metadata.update({"error_number": order_error_id, "issue": "order_transaction_failed", "orderStatus": "failed"})
+    update_stripe_metadata(orderData["payment_id"], metadata)
+
+    return {"error": str(error), "order_error_id": order_error_id}
+    
 @app.route("/place-order", methods=["POST"])
 def place_order():
     data = json.loads(request.data)
     orderData = data.get("orderData")
+
+    if not orderData:
+        return jsonify({"error": "orderData is required"}), 400
+
     try:
-        if not orderData:
-            raise ValueError("orderData is required")
-
-        def callback(session):
-            latestOrder = ordersCollection.aggregate(
-                [
-                    {
-                        "$group": {
-                            "_id": None,
-                            "maxOrderNumber": {"$max": "$order_number"},
-                        }
-                    }
-                ],
-                session=session,
-            )
-            latestOrder = list(latestOrder)
-            latestOrderNumber = (
-                latestOrder[0]["maxOrderNumber"] if latestOrder else None
-            )
-            print(latestOrder)
-
-            newOrderNumber = generate_sequential_order_number(latestOrderNumber)
-            orderData["order_number"] = newOrderNumber
-            orderData["_id"] = newOrderNumber
-
-            token = generate_token(newOrderNumber)
-            orderData["order_token"] = token
-
-            order_insert_result = ordersCollection.insert_one(
-                orderData, session=session
-            )
-            if not order_insert_result.acknowledged:
-                raise Exception("Failed to add order to ordersCollection")
-
-            orderId = str(order_insert_result.inserted_id)
-
-            if orderData["linked_user"]:
-                add_order_to_user_result = usersCollection.update_one(
-                    {"uid": orderData["linked_user"]},
-                    {"$push": {"orders": orderId}},
-                    session=session,
-                )
-                if not add_order_to_user_result.acknowledged:
-                    raise Exception("Failed to add order to user")
-    
-            payment_intent = stripe.PaymentIntent.retrieve(
-                orderData["payment_id"],
-            )
-            metadata = payment_intent["metadata"]
-            metadata["order_id"] = orderId
-            metadata["orderStatus"] = "success"
-            stripe.PaymentIntent.modify(orderData["payment_id"], metadata=metadata)
-
-            return {
-                "message": "Order placed successfully",
-                "orderData": {
-                    "orderNumber": orderId,
-                    "address": orderData["shipping_address"],
-                    "orderItems": orderData["order_items"],
-                    "customer": orderData["customer"],
-                },
-            }
-
         with client.start_session() as session:
-            result = session.with_transaction(callback)
-            print(result)
+            result = session.with_transaction(lambda s: process_order(s, orderData))
+            print("Place Order Success!")
             return jsonify({"orderResult": result}), 200
 
     except Exception as e:
-        print(e)
+        print(traceback.format_exc())
         try:
-
-            def callback(session):
-                latestError = orderErrorsCollection.aggregate(
-                    [
-                        {
-                            "$group": {
-                                "_id": None,
-                                "maxErrorNumber": {"$max": "$error_number"},
-                            }
-                        }
-                    ],
-                    session=session,
-                )
-                latestError = list(latestError)
-                latestErrorNumber = (
-                    latestError[0]["maxErrorNumber"] if latestError else None
-                )
-                newErrorNumber = generate_sequential_error_number(latestErrorNumber)
-                orderData["_id"] = newErrorNumber
-                orderData["error_number"] = newErrorNumber
-                token = generate_token(newErrorNumber)
-                orderData["order_token"] = token
-                order_error_insert_result = orderErrorsCollection.insert_one(
-                    orderData, session=session
-                )
-                order_error_id = str(order_error_insert_result.inserted_id)
-                payment_intent = stripe.PaymentIntent.retrieve(
-                    orderData["payment_id"],
-                )
-                metadata = payment_intent["metadata"]
-                metadata["error_number"] = order_error_id
-                metadata["issue"] = "order_transaction_failed"
-                metadata["orderStatus"] = "failed"
-
-                stripe.PaymentIntent.modify(orderData["payment_id"], metadata=metadata)
-                return jsonify({"error": str(e), "order_error_id": order_error_id}), 500
-
             with client.start_session() as session:
-                result = session.with_transaction(callback)
-                return jsonify({"errorResult": result}), 200
-
+                error_result = session.with_transaction(lambda s: handle_order_error(s, orderData, e))
+                return jsonify({"errorResult": error_result}), 500
         except Exception as log_error:
-            print(log_error)
+            print(traceback.format_exc())
             return jsonify({"error": str(e), "additional_error": str(log_error)}), 500
-
 
 @app.route("/get-orders-summary")
 @authenticate_firebase_token
@@ -849,7 +882,7 @@ endpoint_secret = (
 def stripe_webhook():
     payload = request.get_data(as_text=True)
     sig_header = request.headers.get("Stripe-Signature")
-
+    print("Webhook triggered")
     try:
         event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
 
@@ -933,6 +966,33 @@ def get_linked_user_route():
             return jsonify({"linkedUser": None}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/update-profile', methods=['POST'])
+@authenticate_firebase_token
+def update_profile():
+    data = request.get_json()
+    profile_changes = data.get('profileChanges')
+    user = request.user
+    
+    if not user:
+        return jsonify({'error': 'User not authorized'}), 401
+
+    if not profile_changes:
+        return jsonify({'error': 'Invalid input'}), 400
+
+    # Update the user profile in the database
+    result = usersCollection.update_one(
+        {'uid': user["uid"]},
+        {'$set': profile_changes}
+    )
+
+    if result.matched_count == 0:
+        return jsonify({'error': 'User not found'}), 404
+
+    return jsonify({'data': profile_changes}), 200
+
+if __name__ == '__main__':
+    app.run(debug=True)
     
 if __name__ == "__main__":
     app.run(port=4242, debug=True)
