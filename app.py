@@ -3,12 +3,14 @@ from flask_cors import CORS
 import stripe, logging
 from bson import ObjectId
 import json
-from flask import Flask, jsonify, request, g
+from flask import Flask, jsonify, request, g, abort
 import requests
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
 from functools import wraps
 import firebase_admin
 from firebase_admin import auth as firebase_auth
+from firebase_admin.exceptions import FirebaseError
 import time
 import secrets
 import hashlib
@@ -18,10 +20,162 @@ import traceback
 import os
 from smtp2go.core import Smtp2goClient
 import os
+from validators import validate_fields
+from supertokens_python.recipe.session.syncio import get_session
 
 from dotenv import load_dotenv, dotenv_values 
 
 load_dotenv() 
+from supertokens_python import init, InputAppInfo, SupertokensConfig
+from supertokens_python.recipe import thirdparty, passwordless, session
+from supertokens_python.recipe.thirdparty.provider import ProviderInput, ProviderConfig, ProviderClientConfig
+from supertokens_python.recipe import thirdparty
+
+from supertokens_python.recipe.passwordless import ContactEmailOnlyConfig
+
+from supertokens_python import get_all_cors_headers
+from supertokens_python.framework.flask import Middleware
+
+from supertokens_python.recipe.session.framework.flask import verify_session
+from supertokens_python.recipe.session import SessionContainer
+from supertokens_python.syncio import delete_user
+from supertokens_python.syncio import get_user as supertokens_get_user
+from flask import jsonify, g
+from supertokens_python.recipe.session.interfaces import SessionContainer
+from supertokens_python.recipe.passwordless.interfaces import RecipeInterface
+from typing import Union, Dict, Any, Optional
+from supertokens_python import get_request_from_user_context
+
+
+def override_passwordless_functions(original_implementation: RecipeInterface):
+    original_consume_code = original_implementation.consume_code
+
+    async def consume_code(
+        pre_auth_session_id: str,
+        user_input_code: Union[str, None],
+        device_id: Union[str, None],
+        link_code: Union[str, None],
+        session: Optional[SessionContainer],
+        should_try_linking_with_session_user: Union[bool, None],
+        tenant_id: str,
+        user_context: Dict[str, Any],
+    ):
+        result = None
+
+        try:
+            # Execute the original consume_code logic
+            result = await original_consume_code(
+                pre_auth_session_id,
+                user_input_code,
+                device_id,
+                link_code,
+                session,
+                should_try_linking_with_session_user,
+                tenant_id,
+                user_context,
+            )
+            print("Consume code result:",result.user)
+            print({
+                "pre_auth_session_id": pre_auth_session_id,
+                "user_input_code": user_input_code,
+                "device_id": device_id,
+                "link_code": link_code,
+                "session": session,
+                "should_try_linking_with_session_user": should_try_linking_with_session_user,
+                "tenant_id": tenant_id,
+                "user_context": user_context,
+            })
+
+            user = result.user
+            uid = user.id
+            request = get_request_from_user_context(user_context=user_context)
+            order_id = request.get_header("orderNumber")
+            state = request.get_header("state")
+
+            if not user:
+                raise ValueError("User is not found")
+
+            # Database operations
+            def callback(mongo_session):
+                try:
+                    # Insert user data
+                    usersCollection.insert_one(
+                        {"uid": uid, "email": user.emails[0]},
+                        session=mongo_session,
+                    )
+                except Exception as e:
+                    raise ValueError("Failed to insert user data into MongoDB: " + str(e))
+
+                if state:
+                    if g.order_info in ["token-invalid", "no-token-provided"]:
+                        raise ValueError("Invalid order token")
+
+                    if state in ["not-authenticated-no-linked-user", "authenticated-no-linked-user"]:
+                        # Add order to user's account
+                        add_order_result = usersCollection.update_one(
+                            {"uid": uid},
+                            {"$push": {"orders": order_id}},
+                            session=mongo_session,
+                        )
+                        if add_order_result.modified_count == 0:
+                            raise ValueError("Failed to add order to user")
+
+                        # Link user to order
+                        link_user_result = ordersCollection.update_one(
+                            {"_id": order_id},
+                            {"$set": {"linked_user": uid}},
+                            session=mongo_session,
+                        )
+                        if link_user_result.modified_count == 0:
+                            raise ValueError("Failed to link user to order")
+            print("CREATED",result.created_new_recipe_user)            
+            if result.created_new_recipe_user:
+                with client.start_session() as mongo_session:
+                    mongo_session.with_transaction(callback)   
+                  
+            return result  # Return the original consume_code result on success
+
+        except ValueError as e:
+            print("ValueError during sign-up:", e)
+            delete_user(result.user.id)
+            return jsonify({"error": str(e)}), 400
+
+        except Exception as e:
+            print("Unexpected error during sign-up:", e)
+            delete_user(result.user.id)
+            return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+
+    # Override the consume_code implementation
+    original_implementation.consume_code = consume_code
+    return original_implementation
+
+
+init(
+    app_info=InputAppInfo(
+        app_name="Jesus Shirt Project",
+        api_domain="http://localhost:4242",
+        website_domain="http://localhost:3000",
+        api_base_path="/auth",
+        website_base_path="/auth"
+    ),
+    supertokens_config=SupertokensConfig(
+        # These are the connection details of the app you created on supertokens.com
+        connection_uri="https://st-dev-fa4c9ec0-a64e-11ef-b465-eb3968890c51.aws.supertokens.io",
+        api_key="x2nlb4UxdyirYqtamYpfjOc-fn"
+    ),
+    framework="flask",
+    recipe_list=[
+        session.init(), # initializes session features
+        passwordless.init(
+            flow_type="MAGIC_LINK",
+            contact_config=ContactEmailOnlyConfig(),
+            override=passwordless.InputOverrideConfig(
+                functions=override_passwordless_functions
+            ),
+        )
+    ]
+)
+
 
 SMTP_API_TOKEN = os.getenv("SMTP-API-TOKEN")
 
@@ -38,18 +192,26 @@ stripe.api_key = "sk_test_51OOBnGEvVCl2vla1w7zQ4XYBPSUslUZvifWMvfr2iji0OcoZQzfS3
 app = Flask(
     __name__, static_folder="public", static_url_path="", template_folder="public"
 )
+Middleware(app)
+
 CORS(
     app,
     resources={
-        r"/*": {
+        r"/*": {  # Apply CORS to all routes
             "origins": [
-                "http://localhost:3000",
-                "https://jesus-shirt-shop.netlify.app",
-                "http://localhost:3001",
+                "http://localhost:3000",  # Frontend during development
+                "https://jesus-shirt-shop.netlify.app",  # Production frontend
+                "http://localhost:3001",  # Additional local frontend
             ]
         }
     },
+    supports_credentials=True,  # Required for SuperTokens sessions (cookies)
+    allow_headers=["Content-Type","Order-Token"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
 )
+@app.route('/', defaults={'u_path': ''})  
+@app.route('/<path:u_path>')  
+def catch_all(u_path: str):
+    abort(404)
 TOKEN = "vVSC6FE0b1G4RGuBQ1EnRti9eh87a7Lc0qMlCPIy"
 headers = {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"}
 mongo_connection = "mongodb+srv://caleb:msl22083b@jesus-shirt-project.weyhmji.mongodb.net/mydatabase?retryWrites=true&w=majority&appName=Jesus-Shirt-Project"
@@ -62,18 +224,6 @@ errorDB = client["errors"]
 orderErrorsCollection = errorDB["orderErrors"]
 
 
-def is_running_on_emulator():
-    return (
-        os.getenv('FIREBASE_AUTH_EMULATOR_HOST') or
-        os.getenv('FIRESTORE_EMULATOR_HOST') or
-        os.getenv('FIREBASE_DATABASE_EMULATOR_HOST') or
-        os.getenv('STORAGE_EMULATOR_HOST')
-    )
-
-if is_running_on_emulator():
-    print("Running on Firebase Emulator")
-else:
-    print("Running on live Firebase services")
 class JSONEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, ObjectId):
@@ -214,31 +364,39 @@ def authenticate_firebase_token(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         id_token = request.headers.get("Authorization")
-        uid = request.args.get("uid") or request.json.get("uid")
-        print("uid from auth:", uid)
+        uid = request.args.get("uid") or (request.json and request.json.get("uid"))
         request.user = None
-        if id_token and id_token.startswith("Bearer ") and id_token.split("Bearer ")[1] != "false":
+
+        if id_token and id_token.startswith("Bearer ") and id_token.split("Bearer ")[1] != "false" and id_token.split("Bearer ")[1] != "null":
             id_token = id_token.split("Bearer ")[1]
-            print("ID TOKEN:", id_token)
 
             try:
                 decoded_token = firebase_auth.verify_id_token(id_token, clock_skew_seconds=5)
+                print(decoded_token)
+                email_verified = decoded_token.get('email_verified', False)
+                
+                if hasattr(request, 'url_rule') and hasattr(request.url_rule, 'rule'):
+                    if not email_verified and (request.url_rule.rule != "/add-user"):
+                        raise ValueError("Email is not verified.")
+                else:
+                    print(f"request.url_rule: {request.url_rule}")
+                
                 request.user = decoded_token
-                print(request.user)
 
                 if not uid:
-                    return jsonify({"error": "No UID was provided"}), 400
+                    raise ValueError("No UID was provided")
 
                 if uid != decoded_token["uid"]:
-                    return jsonify({"error": "UID mismatch"}), 401
+                    raise ValueError("UID mismatch")
+                    
             except Exception as e:
-                print("error from auth:",e)
-                if (
-                    request.url_rule.rule == "/add-user"
-                ):
-                    firebase_auth.delete_user(uid)
-
-                return jsonify({"error": "Unauthorized: Invalid token"}), 401
+                print("error from auth:", e)
+                if hasattr(request, 'url_rule') and hasattr(request.url_rule, 'rule'):
+                    if request.url_rule.rule == "/add-user":
+                        firebase_auth.delete_user(uid)
+                else:
+                    print(f"request.url_rule: {request.url_rule}")
+                return jsonify({"error":str(e)}), 401
 
         return f(*args, **kwargs)
 
@@ -247,6 +405,7 @@ def authenticate_firebase_token(f):
 
 def get_user_data(uid, projection):
     userData = usersCollection.find_one({"uid": uid}, projection)
+    print(userData)
     return userData if userData else {}
 
 
@@ -273,32 +432,37 @@ def generate_token(orderId):
     token = hashlib.sha256(order_id_bytes + time_bytes + random_bytes).hexdigest()
     return token
 
+def is_dict_empty(d):
+    return not bool(d)
+
 
 @app.route("/create-payment-intent", methods=["POST"])
-@authenticate_firebase_token
 def create_payment():
     try:
         data = json.loads(request.data)
-        # Create a PaymentIntent with the order amount and currency
         user_id = None
-        user = request.user
+        session = None
+        try:
+            session = get_session(request)
+            print("SESSION PRINT",session)
+        except Exception as e:
+            print("Error while fetching session:", str(e))
 
-        if not user:
-            user_id = None
-        else:
-            user_id = user["uid"]
+        # Create a PaymentIntent with the order amount and currency
+        print("SESSION:", session)
+        if session is not None:
+            try:
+                user_id = session.get_user_id()
+            except Exception as e:
+                print("Error while fetching user ID:", str(e))
+
         checkoutItems = data.get("checkoutItems", None)
         shortenedCheckoutItems = [
             {"id": item["id"], "quantity": item["quantity"], "size": item["size"]}
             for item in checkoutItems
         ]
-        if (
-            isinstance(shortenedCheckoutItems, str)
-            and len(shortenedCheckoutItems) > 500
-        ):
+        if len(shortenedCheckoutItems) > 20:
             return jsonify({"error": "Too much order items"})
-        if user_id == "None":
-            user_id == None
         print("order amount:",calculate_order_amount(shortenedCheckoutItems))    
         intent = stripe.PaymentIntent.create(
             amount=calculate_order_amount(shortenedCheckoutItems),
@@ -322,21 +486,24 @@ def create_payment():
             logging.error("Card expired.")
         else:
             logging.error("Other card error.")
+            
+        return jsonify({"error": str(e)}), 500
     except Exception as e:
         print("error from create-payment-intent:",e)
-        return jsonify(error=str(e)), 403
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/fetch_product")
 def handle_fetch_product():
-    # Parse the JSON data from the request
+    projection = {"_id": 0, "id": 1, "name": 1, "price": 1, "thumbnail": 1,"product_images":1}
+
     try:
         product_id = request.args.get("productID")
 
         if product_id is None:
             return jsonify({"error": "Product ID is required in the request data"}), 400
 
-        product = productsCollection.find_one({"id": product_id})
+        product = productsCollection.find_one({"id": product_id},projection=projection)
 
         if product:
             product = JSONEncoder().encode(product)
@@ -348,18 +515,19 @@ def handle_fetch_product():
         return jsonify({"error": "Invalid JSON format in request data"}), 400
 
 
-@app.route("/get_store-products", methods=["GET"])
+@app.route("/get_store_products", methods=["GET"])
 def get_products():
-    projection = {"_id": 0, "id": 1, "name": 1, "price": 1, "thumbnail": 1}
+    projection = {"_id": 0, "id": 1, "name": 1, "price": 1, "thumbnail": 1,"product_images":1}
     try:
         all_products = list(productsCollection.find({}, projection))
-        all_products = JSONEncoder().encode(all_products)
+        print(all_products)
+        if not all_products:
+            return jsonify({"error": "No products found."}), 404
 
-        result = {"result": all_products}
-        return result, 200
+        return jsonify(all_products), 200
 
-    except Exception as e:  # Catching generic exceptions
-        return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": "An unexpected error occurred while fetching the products."}), 500
 
 
 @app.route("/get-latest-order")
@@ -453,7 +621,7 @@ def process_order(session, orderData):
     "recipients": [orderData["customer"]["emailAddress"]],
     "template_id": "8449130",
     "template_data": {
-        "product_name": "Christian T-Shirts",
+        "product_name": "Jesus-Shirt-Project",
         "orders_url": f'http://localhost:3000/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
         "payment": orderData["payment_id"],
         "shipping": orderData["shipping_cost"],
@@ -540,16 +708,22 @@ def place_order():
             return jsonify({"error": str(e), "additional_error": str(log_error)}), 500
 
 @app.route("/get-orders-summary")
-@authenticate_firebase_token
+@verify_session()
 def get_orders_summary():
     try:
-        user = request.user
-        if not user:
-            return jsonify({"error": "User not authorized"}), 401
-        projection = {"orders": 1, "_id": 0}
-        userData = get_user_data(user["uid"], projection)
-        if not userData:
+        session: SessionContainer = g.supertokens
+        user_id = session.get_user_id()  
+        print("User ID:", user_id)      
+
+        projection = {"orders": 1, "_id": 0, "uid": 1}
+        userData = get_user_data(user_id, projection)
+        
+        if userData is None or is_dict_empty(userData):
             return jsonify({"error": "User cannot be found"}), 404
+        
+        if "orders" not in userData:
+            return jsonify({"orders": []}), 200
+        
         orderProjection = {
             "order_number": 1,
             "status": 1,
@@ -558,22 +732,26 @@ def get_orders_summary():
             "_id": 0,
         }
 
-        ordersList = list(
-            map(
-                lambda order: json.loads(get_order_data(order, orderProjection)), userData["orders"]
-            )
-        )
-        print(ordersList)
-        if ordersList and len(ordersList) > 0:
-            return ordersList, 200
+        ordersList = [
+            json.loads(get_order_data(order, orderProjection)) for order in userData["orders"]
+        ]
+        print("Orders List:", ordersList)
+        
+        if ordersList:
+            return jsonify({"orders": ordersList}), 200
         else:
-            return [], 200
+            return jsonify({"orders": []}), 200
+
     except ValueError as ve:
         return jsonify({"error": "Invalid JSON data"}), 400
     except Exception as e:
-        print(e)
+        print("Error:", e)
         return jsonify({"error": str(e)}), 500
 
+@app.route('/test-superbase',methods=["POST"])
+@verify_session()
+def test_superbase():
+    return jsonify({"message": "Session is valid!"})
 
 @app.route("/get-order-error")
 def get_order_error():
@@ -594,12 +772,11 @@ def get_order_error():
         return jsonify({"error": str(e)}), 500
 
 def handleStatuses(statuses, user, orderNumber, userOrders, linkedUser):
-    statuses["userAuthenticated"] = True if user is not None else False
+    statuses["userAuthenticated"] = bool(user)
     statuses["userHaveOrder"] = (orderNumber in userOrders)
-    statuses["linkedUserMatchesUserUID"] = linkedUser == (user["uid"] if user else None)
+    statuses["linkedUserMatchesUserUID"] = linkedUser == (user["uid"] if user else "NO_UID")
 
 @app.route("/get-order", methods=["GET"])
-@authenticate_firebase_token
 @authenticate_order_token
 def get_order():
     try:
@@ -637,7 +814,7 @@ def get_order():
             return jsonify({"error": "User not authorized","statuses":statuses,"orderTokenVerified":orderTokenVerified, "linkedUserEmail":linkedUserEmail}), 401
 
         if not orderNumber or not user["uid"]:
-            return jsonify({"error": 'orderNumber and user["uid"] are required'}), 400
+            return jsonify({"error": 'orderNumber and user["uid"] are both required'}), 400
 
         if not isinstance(userData, dict):
             return jsonify({"error": "User has not made any orders"}), 500
@@ -692,69 +869,114 @@ def add_order_to_user():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
+def send_email_verification(email,navigatedFrom, orderId):
+    action_code_settings = firebase_auth.ActionCodeSettings(url=f"http://localhost:3000/login?email={email}&from={navigatedFrom}&orderId={orderId}",handle_code_in_app=True)
+    email_verification_link = firebase_auth.generate_email_verification_link(email, action_code_settings=action_code_settings)
+    print("email_verification_link:",email_verification_link)
+    email_payload = {
+        "sender": "tan_xuan_yi_caleb@students.edu.sg",
+        "recipients": [email],
+        "template_id": "0762399",
+        "template_data": {
+            "product_name": "Jesus-Shirt-Project",
+            "confirm_url": email_verification_link,
+        },
+        "custom_headers": {"Your-Custom-Headers": "Custom Values"}
+    }
+    ##handle_send_email(smtp2GoClient, email_payload)
 @app.route("/add-user", methods=["POST"])
-@authenticate_firebase_token
-@authenticate_order_token
+@verify_session()
 def add_user():
-    user = request.user
-    data = json.loads(request.data)
-    uid = data.get("uid")
-    name = data.get("name")
-    email = data.get("email")
-    birthday = data.get("birthday")
-    clothingPreference = data.get("clothingPreference")
+    super_token_session: SessionContainer = g.supertokens 
+
+    uid = super_token_session.get_user_id()
+  
+    data = request.get_json()
+    user = supertokens_get_user(uid)
+    
     orderId = data.get('orderNumber', None)
     state = data.get("state", None)
-    
-    if not user:
-        return jsonify({"error": "User not authorized"}), 401
 
     try:
+        if not data:
+            raise ValueError("No data provided")
+        if not user:
+            raise ValueError("User is not found")
         def callback(session):
-            usersCollection.insert_one(
-                {
-                    "uid": uid,
-                    "name": name,
-                    "email": email,
-                    "birthday": birthday,
-                    "clothingPreference": clothingPreference,
-                }, session=session
-            )
+            try:
+                usersCollection.insert_one(
+                    {
+                        "uid": uid,
+                        "email": user["email"],
+                    }, session=session
+                )
+            except Exception as e:
+                raise ValueError("Failed to insert user data into MongoDB: " + str(e))
             
             if state:
                 if g.order_info in ["token-invalid", "no-token-provided"]:
-                    print("g.order_info:",g.order_info)
+                    print("g.order_info:", g.order_info)
                     raise ValueError("Invalid order token")
+
                 if state in ["not-authenticated-no-linked-user", "authenticated-no-linked-user"]:
-                    addOrderToUserResult = usersCollection.update_one(
-                        {"uid": user["uid"]},
-                        {"$push": {"orders": orderId}},
-                        session=session
-                    )
-                    if addOrderToUserResult.modified_count == 0:
-                        raise ValueError("Failed to add order to user")
-                    
-                    addUserToOrder = ordersCollection.update_one(
-                        {"_id": orderId},
-                        {"$set": {"linked_user": user["uid"]}},
-                        session=session
-                    )
-                    if addUserToOrder.modified_count == 0:
-                        raise ValueError("Failed to add user to order")
-        
+                    try:
+                        addOrderToUserResult = usersCollection.update_one(
+                            {"uid": uid},
+                            {"$push": {"orders": orderId}},
+                            session=session
+                        )
+                        if addOrderToUserResult.modified_count == 0:
+                            raise ValueError("Failed to add order to user")
+                    except Exception as e:
+                        raise ValueError("Failed to update user's orders: " + str(e))
+
+                    try:
+                        addUserToOrder = ordersCollection.update_one(
+                            {"_id": orderId},
+                            {"$set": {"linked_user": uid}},
+                            session=session
+                        )
+                        if addUserToOrder.modified_count == 0:
+                            raise ValueError("Failed to add user to order")
+                    except Exception as e:
+                        raise ValueError("Failed to link user to order: " + str(e))
+
         with client.start_session() as session:
             session.with_transaction(callback)
             return jsonify({"message": "Transaction successful"}), 200
-            
+
     except ValueError as e:
-        print("sign up err:",e)
-        firebase_auth.delete_user(uid)
+        print("ValueError during sign up:", e)
+        delete_user(uid)
         return jsonify({"error": str(e)}), 400
+
     except Exception as e:
-        firebase_auth.delete_user(uid)
+        print("Unexpected error during sign up:", e)
+        delete_user(uid)
         return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
 
+@app.route("/login-from-verify-email", methods=["POST"])
+@authenticate_firebase_token
+def handle_verify_email():
+    data = request.get_json()
+    user = request.user
+    userUID = user["uid"]
+    
+    if not user:
+        return jsonify({"error": "User not authorized"}), 401
+    
+    try:
+        update_verification_status_result = usersCollection.update_one({"uid": userUID}, {"$set": {"emailVerified": True, "email":user["email"]}})
+        
+        if update_verification_status_result.matched_count == 0:
+            return jsonify({"error": "User not found in the database."}), 404
+        
+        return jsonify({"message": "Email verified successfully."}), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": "Failed to verify email: " + str(e)}), 500
+       
 @app.route("/login-with-state", methods=["POST"])
 @authenticate_firebase_token
 @authenticate_order_token
@@ -775,11 +997,11 @@ def handle_login_with_state():
             if g.order_info in ["token-invalid", "no-token-provided"]:
                 print("g.order_info:",g.order_info)
                 raise ValueError("Invalid order token")
-
-            if state in ["authenticated-order-not-in-user-linked-user-not-matched", "not-authenticated-has-linked-user"]:
+            ##have linked user  
+            if state in ["authenticated-order-not-in-user-linked-user-not-matched", "not-authenticated-has-linked-user","authenticated-failed-no-order-token","authenticated-order-token-invalid"]:
                 if linkedUser != user["uid"]:
                     raise ValueError("The account you are trying to login does not match the one associated with order.")
-
+            ##no linked user
             elif state in ["not-authenticated-no-linked-user", "authenticated-no-linked-user"]:
                 addOrderToUserResult = usersCollection.update_one(
                     {"uid": user["uid"]},
@@ -796,10 +1018,6 @@ def handle_login_with_state():
                 )
                 if addUserToOrder.modified_count == 0:
                     raise ValueError("Failed to add user to order")
-
-            elif state in ["authenticated-failed-no-order-token","authenticated-order-token-invalid"]:
-                if linkedUser != user["uid"]:
-                    raise ValueError("The account you are trying to login does not match the one associated with order.")
         
         with client.start_session() as session:
             session.with_transaction(callback)
@@ -816,20 +1034,22 @@ def handle_login_with_state():
 @authenticate_firebase_token
 def get_user():
     user = request.user
-
+    data = request.args
+    projection = json.loads(data.get("projection",None))
+    print(projection)
     if not user:
         return jsonify({"error": "User not authorized"}), 401
     try:
         user = request.user
-        projection = None
 
         userData = get_user_data(user["uid"], projection)
-        userData = JSONEncoder().encode(userData)
-
-        if userData:
-            return userData, 200
-        else:
+        if is_dict_empty(userData):
             return jsonify({"error": "User cannot be found"}), 404
+        
+        print(userData)
+        userData = JSONEncoder().encode(userData)
+        return userData, 200
+
     except ValueError as ve:
         return jsonify({"error": "Invalid JSON data"}), 400
     except Exception as e:
@@ -939,7 +1159,7 @@ def get_orders():
     if not isinstance(order_items, list) or not all(
         isinstance(item, dict) for item in order_items
     ):
-        return jsonify({"error": "Invalid order items format"}), 400
+        return jsonify({"error": f"Invalid order items format {order_items}"}), 400
     projection = {"_id": 0, "id": 1, "name": 1, "price": 1, "thumbnail": 1}
 
     try:
@@ -973,12 +1193,26 @@ def update_profile():
     data = request.get_json()
     profile_changes = data.get('profileChanges')
     user = request.user
+    fields_to_validate = ["name", "birthday", "clothingPreference"]
+    print("profileChanges:", profile_changes)
+
+    errors = validate_fields(profile_changes.keys(), profile_changes)
+    if errors:
+        return jsonify({'errors': errors}), 400
     
     if not user:
         return jsonify({'error': 'User not authorized'}), 401
 
     if not profile_changes:
         return jsonify({'error': 'Invalid input'}), 400
+    
+        # Filter profile_changes to include only the allowed keys
+    allowed_keys = ["name", "birthday", "clothingPreference"]
+    filtered_changes = {key: value for key, value in profile_changes.items() if key in allowed_keys}
+
+    # Ensure there are filtered changes to update
+    if not filtered_changes:
+        return jsonify({'error': 'No valid fields to update'}), 400
 
     # Update the user profile in the database
     result = usersCollection.update_one(
@@ -991,8 +1225,97 @@ def update_profile():
 
     return jsonify({'data': profile_changes}), 200
 
-if __name__ == '__main__':
-    app.run(debug=True)
+@app.route("/update-email", methods=["POST"])
+@authenticate_firebase_token
+def update_email():
+    data = request.get_json()
+    newEmail = data.get("newEmail")
+    user = request.user
+    userUID = user["uid"]
+    
+    if not user:
+        return jsonify({"error": "User not authorized"}), 401
+    
+    if not newEmail:
+        return jsonify({"error": "A new email must be provided"}), 400
+    
+    try:
+        def callback(session):
+            try:
+                # Attempt to update the user's email in Firebase Authentication
+                user_record = firebase_auth.update_user(userUID, email=newEmail, email_verified=False)
+            except firebase_auth.EmailAlreadyExistsError:
+                raise ValueError("The new email address is already in use by another account.")
+            except ValueError as e:
+                # Handle specific ValueError related to invalid user ID or properties
+                raise ValueError("Invalid user ID or properties: " + str(e))
+            except FirebaseError as e:
+                # Handle general Firebase errors
+                raise ValueError("Failed to update email in Firebase Authentication: " + str(e))
+            
+            try:
+                updateEmailResult = usersCollection.update_one({"uid": userUID}, {
+                    "$set": {"email": newEmail, "emailVerified": False}
+                }, session=session)
+                
+                if updateEmailResult.matched_count == 0:
+                    # Rollback Firebase update if MongoDB update fails
+                    firebase_auth.update_user(userUID, email=user["email"], email_verified=user["emailVerified"])
+                    raise ValueError("User not found in MongoDB")
+            except PyMongoError as e:
+                # Rollback Firebase update if MongoDB update fails
+                firebase_auth.update_user(userUID, email=user["email"], email_verified=user["emailVerified"])
+                raise ValueError("Failed to update email in database: " + str(e))
+            
+            try:
+                send_email_verification(newEmail, "change-email", None)
+            except Exception as e:
+                # Rollback both Firebase and MongoDB updates if email verification fails
+                firebase_auth.update_user(userUID, email=user["email"], email_verified=user["emailVerified"])
+                usersCollection.update_one({"uid": userUID}, {
+                    "$set": {"email": user["email"], "emailVerified": user["emailVerified"]}
+                }, session=session)
+                raise ValueError("Failed to send email verification: " + str(e))
+            
+            return {"status": "success"}
+
+        with client.start_session() as session:
+            result = session.with_transaction(callback)
+            return jsonify(result), 200
+    except Exception as e:
+        print(e)
+        return jsonify({'error': str(e)}), 500
+    
+@app.route("/resend-verification-email", methods=["POST"])
+def resend_verification_email():
+    # Extract data from the request
+    data = request.get_json()
+    email = data.get("email")
+    navigatedFrom = data.get("navigatedFrom")
+    orderId = data.get("orderId")
+
+    # Input validation
+    if not email:
+        return jsonify({"error": "Email is required"}), 400
+    if not navigatedFrom:
+        return jsonify({"error": "NavigatedFrom is required"}), 400
+
+    try:
+        # Call the function to send the email
+        send_email_verification(email, navigatedFrom, orderId)
+        return jsonify({"message": "Verification email sent successfully!"}), 200
+    except Exception as e:
+        error_message = str(e)
+        print(error_message)  # Log the error for debugging
+
+        # Check for specific error message
+        if "TOO_MANY_ATTEMPTS_TRY_LATER" in error_message:
+            return jsonify({"error": "Too many attempts, please try again later."}), 429  # 429 Too Many Requests
+        else:
+            # Return a generic error message for other exceptions
+            return jsonify({"error": "Failed to send verification email. Please try again."}), 500
+
+    
     
 if __name__ == "__main__":
     app.run(port=4242, debug=True)
