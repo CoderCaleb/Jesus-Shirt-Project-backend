@@ -38,14 +38,55 @@ from supertokens_python.framework.flask import Middleware
 
 from supertokens_python.recipe.session.framework.flask import verify_session
 from supertokens_python.recipe.session import SessionContainer
-from supertokens_python.syncio import delete_user
+from supertokens_python.asyncio import delete_user
 from supertokens_python.syncio import get_user as supertokens_get_user
 from flask import jsonify, g
 from supertokens_python.recipe.session.interfaces import SessionContainer
 from supertokens_python.recipe.passwordless.interfaces import RecipeInterface
 from typing import Union, Dict, Any, Optional
 from supertokens_python import get_request_from_user_context
+from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
+from supertokens_python import init, InputAppInfo
+from supertokens_python.recipe.passwordless.types import EmailDeliveryOverrideInput, EmailTemplateVars
+from typing import Dict, Any
+from supertokens_python.ingredients.emaildelivery.types import EmailDeliveryConfig
 
+def custom_email_deliver(original_implementation: EmailDeliveryOverrideInput) -> EmailDeliveryOverrideInput:
+    original_send_email = original_implementation.send_email
+
+    async def send_email(template_vars: EmailTemplateVars, user_context: Dict[str, Any]) -> None:
+        assert template_vars.url_with_link_code is not None
+        request = get_request_from_user_context(user_context=user_context)
+        order_id = request.get_header("orderNumber")
+        state = request.get_header("state")
+        order_token = request.get_header("Order-Token")
+        print("Order headers", order_id, order_token)
+
+        parsed_url = urlparse(template_vars.url_with_link_code)
+        query_params = parse_qs(parsed_url.query)
+        
+        if order_id:
+            query_params["order_id"] = order_id
+        if state:
+            query_params["state"] = state
+        if order_token:
+            query_params["order_token"] = order_token
+
+        updated_query = urlencode(query_params, doseq=True)
+        updated_url = urlunparse(parsed_url._replace(query=updated_query))
+        template_vars.url_with_link_code = updated_url
+
+        return await original_send_email(template_vars, user_context)
+
+    original_implementation.send_email = send_email
+    return original_implementation
+
+from supertokens_python.recipe.passwordless.interfaces import (
+    RecipeInterface,
+)
+from supertokens_python.recipe.session import SessionContainer
+from supertokens_python.types import GeneralErrorResponse
+from typing import Union, Optional, Dict, Any
 
 def override_passwordless_functions(original_implementation: RecipeInterface):
     original_consume_code = original_implementation.consume_code
@@ -74,7 +115,7 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
                 tenant_id,
                 user_context,
             )
-            print("Consume code result:",result.user)
+            print("Consume code result:", result.user)
             print({
                 "pre_auth_session_id": pre_auth_session_id,
                 "user_input_code": user_input_code,
@@ -90,28 +131,32 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
             uid = user.id
             request = get_request_from_user_context(user_context=user_context)
             order_id = request.get_header("orderNumber")
-            state = request.get_header("state")
+            state = request.get_header("state").strip() if request.get_header("state") else None
+            order_token = request.get_header("Order-Token")
+            print(order_id, state, order_token, "consume code headers")
 
             if not user:
                 raise ValueError("User is not found")
 
-            # Database operations
+            authenticate_order_token_function(order_token=order_token, order_number=order_id)
+
             def callback(mongo_session):
-                try:
-                    # Insert user data
-                    usersCollection.insert_one(
-                        {"uid": uid, "email": user.emails[0]},
-                        session=mongo_session,
-                    )
-                except Exception as e:
-                    raise ValueError("Failed to insert user data into MongoDB: " + str(e))
+                if result.created_new_recipe_user:
+                    try:
+                        usersCollection.insert_one(
+                            {"uid": uid, "email": user.emails[0]},
+                            session=mongo_session,
+                        )
+                    except Exception as e:
+                        raise ValueError("Failed to insert user data into MongoDB")
+
+                print(state in ["valid_token_unauthenticated_no_linked_user", "valid_token_authenticated_no_linked_user"], "state check for order", state, type(state))
 
                 if state:
                     if g.order_info in ["token-invalid", "no-token-provided"]:
                         raise ValueError("Invalid order token")
 
-                    if state in ["not-authenticated-no-linked-user", "authenticated-no-linked-user"]:
-                        # Add order to user's account
+                    if state in ["valid_token_unauthenticated_no_linked_user", "valid_token_authenticated_no_linked_user"]:
                         add_order_result = usersCollection.update_one(
                             {"uid": uid},
                             {"$push": {"orders": order_id}},
@@ -120,7 +165,6 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
                         if add_order_result.modified_count == 0:
                             raise ValueError("Failed to add order to user")
 
-                        # Link user to order
                         link_user_result = ordersCollection.update_one(
                             {"_id": order_id},
                             {"$set": {"linked_user": uid}},
@@ -128,22 +172,49 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
                         )
                         if link_user_result.modified_count == 0:
                             raise ValueError("Failed to link user to order")
-            print("CREATED",result.created_new_recipe_user)            
-            if result.created_new_recipe_user:
-                with client.start_session() as mongo_session:
-                    mongo_session.with_transaction(callback)   
-                  
+                    else:
+                        linked_user = g.order_info["linked_user"]
+                        if linked_user != uid:
+                            raise ValueError("The account you are trying to login does not match the one associated with order.")
+
+            print("CREATED", result.created_new_recipe_user)
+            with client.start_session() as mongo_session:
+                mongo_session.with_transaction(callback)
+
             return result  # Return the original consume_code result on success
 
         except ValueError as e:
             print("ValueError during sign-up:", e)
-            delete_user(result.user.id)
-            return jsonify({"error": str(e)}), 400
+            error_message = str(e)
+            # Handle specific error cases and raise a consolidated GeneralErrorResponse
+            if "Failed to insert user data into MongoDB" in error_message:
+                general_error = "Oops! We couldn't save your information right now. Please try again later."
+            elif error_message == "Invalid order token":
+                general_error = "The order details you provided are invalid. Please check and try again."
+            elif error_message == "Failed to add order to user":
+                general_error = "We encountered an issue adding the order to your account. Please refresh and try again."
+            elif error_message == "Failed to link user to order":
+                general_error = "We couldn't link your account to the order. Please contact support for assistance."
+            elif error_message == "The account you are trying to login does not match the one associated with order.":
+                general_error = "It seems you're trying to log in with a different account. Please use the correct account or contact support."
+            elif "User is not found" in error_message:
+                general_error = "We couldn't find your account. Please make sure you're using the correct credentials."
+            else:
+                general_error = "An unexpected error occurred. Please try again or contact support for help."
+
+            # Delete user and return the consolidated error
+            if result and result.user:
+                await delete_user(result.user.id)
+            print("general error msg:",general_error)    
+
+            return GeneralErrorResponse(message=general_error)
 
         except Exception as e:
             print("Unexpected error during sign-up:", e)
-            delete_user(result.user.id)
-            return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+            # Handle unexpected errors
+            if result and result.user:
+                await delete_user(result.user.id)
+            return GeneralErrorResponse(message="An unexpected error occurred. Please try again or contact support for help.")
 
     # Override the consume_code implementation
     original_implementation.consume_code = consume_code
@@ -172,6 +243,7 @@ init(
             override=passwordless.InputOverrideConfig(
                 functions=override_passwordless_functions
             ),
+            email_delivery=EmailDeliveryConfig(override=custom_email_deliver)
         )
     ]
 )
@@ -206,7 +278,7 @@ CORS(
         }
     },
     supports_credentials=True,  # Required for SuperTokens sessions (cookies)
-    allow_headers=["Content-Type","Order-Token"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
+    allow_headers=["Content-Type","Order-Token","orderNumber","state"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
 )
 @app.route('/', defaults={'u_path': ''})  
 @app.route('/<path:u_path>')  
@@ -324,6 +396,36 @@ def generate_sequential_error_number(last_error_number):
 
     return next_error_number
 
+def authenticate_order_token_function(order_token, order_number):
+    g.order_info = "token-invalid"
+
+    if order_token == "null" or not order_token:
+        order_token = None
+    
+    print("Order id:", order_number)
+
+    if order_token:
+        try:
+            order_data = json.loads(get_order_data(order_number, None))
+            if not order_data:
+                return jsonify({"error": "Failed to fetch order token"}), 400
+            order_token_from_db = order_data.get("order_token", None) if order_data else None
+            print("order_token_from_db:", order_token_from_db, "order_token_from_frontend:", order_token)
+            if order_data and order_token_from_db == order_token:
+                g.order_info = order_data
+            else:
+                g.order_info = "token-invalid"
+        except json.JSONDecodeError as e:
+            print("JSON decode error:", str(e))
+            g.order_info = "token-invalid"
+        except Exception as e:
+            print("Unexpected error:", str(e))
+            g.order_info = "token-invalid"
+    else:
+        g.order_info = "no-token-provided"
+
+    return g.order_info
+
 def authenticate_order_token(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -405,7 +507,7 @@ def authenticate_firebase_token(f):
 
 def get_user_data(uid, projection):
     userData = usersCollection.find_one({"uid": uid}, projection)
-    print(userData)
+    print("uid",uid)
     return userData if userData else {}
 
 
@@ -435,26 +537,30 @@ def generate_token(orderId):
 def is_dict_empty(d):
     return not bool(d)
 
+def get_session_and_user_id(request):
+    user_id = None
+    session = None
+    try:
+        session = get_session(request)
+        print("SESSION PRINT",session)
+    except Exception as e:
+        print("Error while fetching session:", str(e))
+
+    # Create a PaymentIntent with the order amount and currency
+    print("SESSION:", session)
+    if session is not None:
+        try:
+            user_id = session.get_user_id()
+        except Exception as e:
+            print("Error while fetching user ID:", str(e))
+    return user_id, session      
+
 
 @app.route("/create-payment-intent", methods=["POST"])
 def create_payment():
     try:
         data = json.loads(request.data)
-        user_id = None
-        session = None
-        try:
-            session = get_session(request)
-            print("SESSION PRINT",session)
-        except Exception as e:
-            print("Error while fetching session:", str(e))
-
-        # Create a PaymentIntent with the order amount and currency
-        print("SESSION:", session)
-        if session is not None:
-            try:
-                user_id = session.get_user_id()
-            except Exception as e:
-                print("Error while fetching user ID:", str(e))
+        user_id,_=get_session_and_user_id(request)
 
         checkoutItems = data.get("checkoutItems", None)
         shortenedCheckoutItems = [
@@ -717,7 +823,7 @@ def get_orders_summary():
 
         projection = {"orders": 1, "_id": 0, "uid": 1}
         userData = get_user_data(user_id, projection)
-        
+        print("userData",userData)
         if userData is None or is_dict_empty(userData):
             return jsonify({"error": "User cannot be found"}), 404
         
@@ -771,79 +877,177 @@ def get_order_error():
         print(e)
         return jsonify({"error": str(e)}), 500
 
-def handleStatuses(statuses, user, orderNumber, userOrders, linkedUser):
-    statuses["userAuthenticated"] = bool(user)
-    statuses["userHaveOrder"] = (orderNumber in userOrders)
-    statuses["linkedUserMatchesUserUID"] = linkedUser == (user["uid"] if user else "NO_UID")
+def determine_order_state(order_token_verified, is_authenticated, has_linked_user, order_error, linked_user_email, order_number, order_token):
+    """
+    Determine the appropriate state and action for the order flow.
+    
+    Args:
+        order_token_verified (str): Status of order token verification 
+        is_authenticated (bool): Whether the user is authenticated
+        has_linked_user (bool): Whether the order has a linked user
+        order_error (bool): Whether there's an order-related error
+        linked_user_email (str): Email of the linked user
+    
+    Returns:
+        dict: Contains state, redirect information, and message
+    """
+    # Case 1: Invalid or Missing orderToken
+    if order_token_verified in ["no-token-provided", "token-invalid"]:
+        if has_linked_user:
+            # Case 1a: Has Linked User
+            if order_error:
+                return {
+                    "state": "token_invalid_linked_user",
+                    "redirect": "/auth",
+                }
+            else:
+                return {
+                    "state": "token_invalid_linked_user",
+                    "action": "display_order"
+                }
+        else:
+            # Case 1b: No Linked User
+            return {
+                "state": "token_invalid_no_linked_user",
+                "redirect": "resend_order_link",
+                "action": "resend_order_link"
+            }
+    
+    # Case 2: Valid orderToken
+    if not is_authenticated:
+        # Scenario 2a: Unauthenticated User
+        if has_linked_user:
+            return {
+                "state": "valid_token_unauthenticated_linked_user",
+                "redirect": "/auth",
+                "linkedUserEmail": linked_user_email
+            }
+        else:
+            return {
+                "state": "valid_token_unauthenticated_no_linked_user", 
+                "redirect": "/auth",
+            }
+    
+    # Scenario 2b: Authenticated User
+    if has_linked_user:
+        if order_error:
+            return {
+                "state": "valid_token_authenticated_order_error",
+                "redirect": "/auth", 
+                "linkedUserEmail": linked_user_email
+            }
+        else:
+            return {
+                "state": "valid_token_authenticated_no_order_error",
+                "action": "display_order"
+            }
+    else:
+        return {
+            "state": "valid_token_authenticated_no_linked_user",
+            "redirect": f"/link-order",
+        }
 
-@app.route("/get-order", methods=["GET"])
+@app.route("/get-order", methods=["POST", "GET"])
 @authenticate_order_token
 def get_order():
     try:
-        user = request.user
-        orderTokenVerified = False
-        
+        # First part: Original `get_order` functionality
+        user_id, _ = get_session_and_user_id(request)
         projection = {"orders": 1, "_id": 0}
-        userData = get_user_data(user["uid"] if user else None, projection)
         
-        orderNumber = request.args.get("orderNumber")
-        linkedUserFromDB = json.loads(get_linked_user(orderNumber))  
-        
+        # Fetch necessary data
+        userData = get_user_data(user_id, projection)
+        orderNumber = request.args.get("orderNumber") if request.method == "GET" else None
+        linkedUserFromDB = json.loads(get_linked_user(orderNumber))
         userOrders = userData.get("orders", [])
         
-        statuses = {"userAuthenticated":False,"linkedUserMatchesUserUID":False,"userHaveOrder":False,"hasLinkedUser":True if linkedUserFromDB is not None else False}
-
-        orderInfo = g.get('order_info', None)
-        if orderInfo == "no-token-provided":
-            orderTokenVerified = "no-token-provided"
-        elif orderInfo == "token-invalid":
-            orderTokenVerified = "token-invalid"
-        else:
-            orderTokenVerified = "token-verified"
+        if not orderNumber:
+            return jsonify({"error": "No order number is provided"}), 403
         
+        # Order token verification
+        orderInfo = g.get("order_info", None)
+        order_token_verified = (
+            "no-token-provided" if orderInfo == "no-token-provided"
+            else "token-invalid" if orderInfo == "token-invalid"
+            else "token-verified"
+        )
+        
+        # Prepare data for state determination
+        is_authenticated = bool(user_id)
+        has_linked_user = linkedUserFromDB is not None
+        order_error = (
+            not is_authenticated or 
+            orderNumber not in userOrders or 
+            (has_linked_user and linkedUserFromDB != user_id)
+        )
+        
+        # Fetch linked user email
         linkedUserEmail = None
-            
-        if orderTokenVerified=="token-verified":    
-            linkedUserInfo = firebase_auth.get_user(linkedUserFromDB) if linkedUserFromDB else None
-            linkedUserEmail = linkedUserInfo.email if linkedUserInfo else None
-         
-        print("linkedUserFromDB",linkedUserEmail)
-
-        if not user:
-            handleStatuses(statuses,user, orderNumber, userOrders, linkedUserFromDB)
-            return jsonify({"error": "User not authorized","statuses":statuses,"orderTokenVerified":orderTokenVerified, "linkedUserEmail":linkedUserEmail}), 401
-
-        if not orderNumber or not user["uid"]:
-            return jsonify({"error": 'orderNumber and user["uid"] are both required'}), 400
-
-        if not isinstance(userData, dict):
-            return jsonify({"error": "User has not made any orders"}), 500
-
-        if not isinstance(userOrders, list):
-            return jsonify({"error": "Invalid orders format in userData"}), 500
-        print("linkedUserFromDb:",linkedUserFromDB, "user.uid:",user["uid"])
-        if (orderNumber not in userOrders):
-            handleStatuses(statuses,user, orderNumber, userOrders, linkedUserFromDB)
-            return jsonify({"error": "User not authorized to view this order","statuses":statuses,"orderTokenVerified":orderTokenVerified, "linkedUserEmail":linkedUserEmail}), 403
+        if order_token_verified == "token-verified" and has_linked_user:
+            linkedUserInfo = get_user_data(linkedUserFromDB, {"email": 1, "_id": 0})
+            print(linkedUserInfo)
+            linkedUserEmail = linkedUserInfo.get("email")
         
-        if linkedUserFromDB != user["uid"]:
-            handleStatuses(statuses,user, orderNumber, userOrders, linkedUserFromDB)
-            return jsonify({"error": "Order linked user does not match account uid","statuses":statuses,"orderTokenVerified":orderTokenVerified, "linkedUserEmail":linkedUserEmail}), 403
+        # Determine order flow state
+        order_state = determine_order_state(
+            order_token_verified, 
+            is_authenticated, 
+            has_linked_user, 
+            order_error, 
+            linkedUserEmail,
+            orderNumber,
+            order_token = request.headers.get('Order-Token')
+        )
+        
+        # Handle different states
+        if "redirect" in order_state:
+            print({ "linkedUserEmail": order_state.get("linkedUserEmail")})
+            return jsonify({
+                "error": "An error occurred when fetching order",
+                "state": order_state["state"],
+                "redirect": order_state["redirect"],
+                "linkedUserEmail": order_state.get("linkedUserEmail")
+            }), 401 if "auth" in order_state["redirect"] else 403
+        
+        # If action is to display order
+        if order_state.get("action") == "display_order":
+            orderData = orderInfo if orderInfo not in ["no-token-provided", "token-invalid"] else json.loads(get_order_data(orderNumber, None))
+            
+            if not orderData:
+                return jsonify({"error": "Order cannot be found"}), 404
+            
+            payment_method_id = orderData["payment_method"]
+            payment_method_data = stripe.PaymentMethod.retrieve(payment_method_id)
+            
+            # Second part: Integrate `get_orders` functionality
+            order_items = orderData["order_items"]
+            if isinstance(order_items, str):
+                order_items = json.loads(order_items)
+            if not order_items:
+                return jsonify({"error": "Order items not provided"}), 400
 
-        orderData = orderInfo if orderInfo != "no-token-provided" and orderInfo != "token-invalid" else json.loads(get_order_data(orderNumber, None))
-        if not orderData:
-            return jsonify({"error": "Order cannot be found"}), 404
+            # Ensure order_items is a list of dictionaries
+            if not isinstance(order_items, list) or not all(
+                isinstance(item, dict) for item in order_items
+            ):
+                return jsonify({"error": f"Invalid order items format {order_items}"}), 400
+            projection = {"_id": 0, "id": 1, "name": 1, "price": 1, "thumbnail": 1}
 
-        payment_method_id = orderData["payment_method"]
-        payment_method_data = stripe.PaymentMethod.retrieve(payment_method_id)
-        print("orderinfoverified:",orderTokenVerified)
+            try:
+                final_order_data = get_full_order_data(order_items, projection)
+                if "error" in final_order_data:
+                    return jsonify({"error": final_order_data["error"]}), 404
 
-        return jsonify({
-            "orderData": orderData,
-            "paymentData": payment_method_data,
-            "orderTokenVerified": orderTokenVerified,
-        }), 200
-
+                orderData["full_order_items"] = final_order_data["result"]
+                return jsonify({
+                    "orderData": orderData,
+                    "paymentData": payment_method_data,
+                    "orderTokenVerified": order_token_verified,
+                    "state": order_state["state"],
+                }), 200
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+    
     except ValueError as ve:
         print(traceback.format_exc())
         return jsonify({"error": "Invalid JSON data"}), 400
@@ -884,8 +1088,9 @@ def send_email_verification(email,navigatedFrom, orderId):
         "custom_headers": {"Your-Custom-Headers": "Custom Values"}
     }
     ##handle_send_email(smtp2GoClient, email_payload)
-@app.route("/add-user", methods=["POST"])
+@app.route("/link-order", methods=["POST"])
 @verify_session()
+@authenticate_order_token
 def add_user():
     super_token_session: SessionContainer = g.supertokens 
 
@@ -895,7 +1100,10 @@ def add_user():
     user = supertokens_get_user(uid)
     
     orderId = data.get('orderNumber', None)
-    state = data.get("state", None)
+    linkedUserFromDB = json.loads(get_linked_user(orderId))
+    
+    if linkedUserFromDB:
+        return jsonify({"error":"Order already has a linked user"}),401
 
     try:
         if not data:
@@ -903,43 +1111,31 @@ def add_user():
         if not user:
             raise ValueError("User is not found")
         def callback(session):
+            if g.order_info in ["token-invalid", "no-token-provided"]:
+                print("g.order_info:", g.order_info)
+                raise ValueError("Invalid order token")
+
             try:
-                usersCollection.insert_one(
-                    {
-                        "uid": uid,
-                        "email": user["email"],
-                    }, session=session
+                addOrderToUserResult = usersCollection.update_one(
+                    {"uid": uid},
+                    {"$push": {"orders": orderId}},
+                    session=session
                 )
+                if addOrderToUserResult.modified_count == 0:
+                    raise ValueError("Failed to add order to user")
             except Exception as e:
-                raise ValueError("Failed to insert user data into MongoDB: " + str(e))
-            
-            if state:
-                if g.order_info in ["token-invalid", "no-token-provided"]:
-                    print("g.order_info:", g.order_info)
-                    raise ValueError("Invalid order token")
+                raise ValueError("Failed to update user's orders: " + str(e))
 
-                if state in ["not-authenticated-no-linked-user", "authenticated-no-linked-user"]:
-                    try:
-                        addOrderToUserResult = usersCollection.update_one(
-                            {"uid": uid},
-                            {"$push": {"orders": orderId}},
-                            session=session
-                        )
-                        if addOrderToUserResult.modified_count == 0:
-                            raise ValueError("Failed to add order to user")
-                    except Exception as e:
-                        raise ValueError("Failed to update user's orders: " + str(e))
-
-                    try:
-                        addUserToOrder = ordersCollection.update_one(
-                            {"_id": orderId},
-                            {"$set": {"linked_user": uid}},
-                            session=session
-                        )
-                        if addUserToOrder.modified_count == 0:
-                            raise ValueError("Failed to add user to order")
-                    except Exception as e:
-                        raise ValueError("Failed to link user to order: " + str(e))
+            try:
+                addUserToOrder = ordersCollection.update_one(
+                    {"_id": orderId},
+                    {"$set": {"linked_user": uid}},
+                    session=session
+                )
+                if addUserToOrder.modified_count == 0:
+                    raise ValueError("Failed to add user to order")
+            except Exception as e:
+                raise ValueError("Failed to link user to order: " + str(e))
 
         with client.start_session() as session:
             session.with_transaction(callback)
@@ -947,12 +1143,10 @@ def add_user():
 
     except ValueError as e:
         print("ValueError during sign up:", e)
-        delete_user(uid)
         return jsonify({"error": str(e)}), 400
 
     except Exception as e:
         print("Unexpected error during sign up:", e)
-        delete_user(uid)
         return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
 
 @app.route("/login-from-verify-email", methods=["POST"])
@@ -1169,21 +1363,6 @@ def get_orders():
 
         return jsonify({"order_data": final_order_data["result"]}), 200
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/get-linked-user", methods=["GET"])
-def get_linked_user_route():
-    orderNumber = request.args.get("orderNumber")
-    if not orderNumber:
-        return jsonify({"error": "orderNumber is required"}), 400
-    
-    try:
-        linked_user = get_linked_user(orderNumber)
-        if linked_user:
-            return jsonify({"linkedUser": json.loads(linked_user)}), 200
-        else:
-            return jsonify({"linkedUser": None}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
