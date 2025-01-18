@@ -3,7 +3,7 @@ from flask_cors import CORS
 import stripe, logging
 from bson import ObjectId
 import json
-from flask import Flask, jsonify, request, g, abort
+from flask import Flask, jsonify, request, g, abort, current_app
 import requests
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -22,7 +22,8 @@ from smtp2go.core import Smtp2goClient
 import os
 from validators import validate_fields
 from supertokens_python.recipe.session.syncio import get_session
-
+import jwt
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv, dotenv_values 
 
 load_dotenv() 
@@ -86,6 +87,12 @@ from supertokens_python.recipe.passwordless.interfaces import (
 )
 from supertokens_python.recipe.session import SessionContainer
 from supertokens_python.types import GeneralErrorResponse
+from supertokens_python.recipe.passwordless.interfaces import (
+    ConsumeCodeOkResult,
+    ConsumeCodeIncorrectUserInputCodeError,
+    ConsumeCodeExpiredUserInputCodeError,
+    ConsumeCodeRestartFlowError,
+)
 from typing import Union, Optional, Dict, Any
 
 def override_passwordless_functions(original_implementation: RecipeInterface):
@@ -100,7 +107,13 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
         should_try_linking_with_session_user: Union[bool, None],
         tenant_id: str,
         user_context: Dict[str, Any],
-    ):
+    )-> Union[
+        ConsumeCodeOkResult,
+        ConsumeCodeIncorrectUserInputCodeError,
+        ConsumeCodeExpiredUserInputCodeError,
+        ConsumeCodeRestartFlowError,
+        GeneralErrorResponse,
+    ]:
         result = None
 
         try:
@@ -203,23 +216,60 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
                 general_error = "An unexpected error occurred. Please try again or contact support for help."
 
             # Delete user and return the consolidated error
-            if result and result.user:
+            if result and result.user and result.created_new_recipe_user:
                 await delete_user(result.user.id)
-            print("general error msg:",general_error)    
-
-            return GeneralErrorResponse(message=general_error)
+                
+            raise ValueError(general_error) from e
 
         except Exception as e:
             print("Unexpected error during sign-up:", e)
             # Handle unexpected errors
-            if result and result.user:
+            if result and result.user and result.created_new_recipe_user:
                 await delete_user(result.user.id)
-            return GeneralErrorResponse(message="An unexpected error occurred. Please try again or contact support for help.")
+            raise ValueError("An unexpected error occurred. Please try again or contact support for help.") from e
 
     # Override the consume_code implementation
     original_implementation.consume_code = consume_code
     return original_implementation
 
+from supertokens_python.recipe.passwordless.interfaces import APIOptions
+from supertokens_python.recipe.passwordless.interfaces import APIInterface
+from supertokens_python.recipe.passwordless.asyncio import (
+    list_codes_by_pre_auth_session_id,
+)
+
+def override_passwordless_apis(original_implementation: APIInterface):
+
+    original_consume_code_post = original_implementation.consume_code_post
+
+    async def consume_code_post(
+        pre_auth_session_id: str,
+        user_input_code: Union[str, None],
+        device_id: Union[str, None],
+        link_code: Union[str, None],
+        session: Optional[SessionContainer],
+        should_try_linking_with_session_user: Union[bool, None],
+        tenant_id: str,
+        api_options: APIOptions,
+        user_context: Dict[str, Any],
+    ):
+        try:
+            return await original_consume_code_post(
+                pre_auth_session_id,
+                user_input_code,
+                device_id,
+                link_code,
+                session,
+                should_try_linking_with_session_user,
+                tenant_id,
+                api_options,
+                user_context,
+            )
+        except Exception as e:
+            return GeneralErrorResponse(str(e))                
+
+    original_implementation.consume_code_post = consume_code_post
+    return original_implementation
 
 init(
     app_info=InputAppInfo(
@@ -241,7 +291,8 @@ init(
             flow_type="MAGIC_LINK",
             contact_config=ContactEmailOnlyConfig(),
             override=passwordless.InputOverrideConfig(
-                functions=override_passwordless_functions
+                functions=override_passwordless_functions,
+                apis=override_passwordless_apis,
             ),
             email_delivery=EmailDeliveryConfig(override=custom_email_deliver)
         )
@@ -260,10 +311,12 @@ cred = firebase_admin.credentials.Certificate(
 firebase_admin.initialize_app(cred)
 
 stripe.api_key = "sk_test_51OOBnGEvVCl2vla1w7zQ4XYBPSUslUZvifWMvfr2iji0OcoZQzfS39yYA6et6v9jKkb35D5040HdwHAvQ4fUfN7p005LTIQPJ5"
+dify_api_key = "app-lOS6ArmsRqAhLXIkptRg1idM"
 
 app = Flask(
     __name__, static_folder="public", static_url_path="", template_folder="public"
 )
+app.config['SECRET_KEY'] = "0fb36cffb99bb06e51deeab7b1d5a5952d99c635b6ebf5dbb0f667b0277088135a7a73106542517e0975b36acf6157c6be271c43e3e89846110e24bd51a8b430"
 Middleware(app)
 
 CORS(
@@ -274,11 +327,12 @@ CORS(
                 "http://localhost:3000",  # Frontend during development
                 "https://jesus-shirt-shop.netlify.app",  # Production frontend
                 "http://localhost:3001",  # Additional local frontend
+                "http://localhost", # dify
             ]
         }
     },
     supports_credentials=True,  # Required for SuperTokens sessions (cookies)
-    allow_headers=["Content-Type","Order-Token","orderNumber","state"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
+    allow_headers=["Content-Type","Order-Token","orderNumber","state","Access-Token"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
 )
 @app.route('/', defaults={'u_path': ''})  
 @app.route('/<path:u_path>')  
@@ -352,9 +406,9 @@ def calculate_order_amount(items):
     return int(total_price * 100)
 
 
-def generate_unique_suffix(length=8):
-    # Generate a unique suffix using random letters
-    return "".join(random.choices(string.ascii_uppercase, k=length))
+def generate_unique_suffix(length=4):
+    # Generate a unique alphanumeric suffix
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 
 def generate_sequential_order_number(last_order_number):
@@ -376,6 +430,31 @@ def generate_sequential_order_number(last_order_number):
 
     return next_order_number
 
+
+def generate_jwt(user_id):
+    """
+    Generate a JWT for the user.
+    """
+    payload = {
+        'user_id': user_id,
+        'exp': datetime.now(timezone.utc) + timedelta(minutes=15),  # 15 minutes expiry
+        'iat': datetime.now(timezone.utc)
+    }
+    secret_key = current_app.config['SECRET_KEY']
+    return jwt.encode(payload, secret_key, algorithm='HS256')
+
+def validate_jwt(token):
+    """
+    Validate the JWT and return the decoded payload.
+    """
+    secret_key = current_app.config['SECRET_KEY']
+    try:
+        decoded = jwt.decode(token, secret_key, algorithms=['HS256'])
+        return decoded  # Contains 'user_id', 'exp', etc.
+    except jwt.ExpiredSignatureError:
+        return None  # Token has expired
+    except jwt.InvalidTokenError:
+        return None  # Token is invalid
 
 def generate_sequential_error_number(last_error_number):
     print("Last error number:", last_error_number)
@@ -740,7 +819,6 @@ def process_order(session, orderData):
         "items": orderData["order_items"],
         "total": orderData["total_price"]
     },
-    "custom_headers": {"Your-Custom-Headers": "Custom Values"}
 }
  
     emailRes = handle_send_email(smtp2GoClient, email_payload)
@@ -899,6 +977,7 @@ def determine_order_state(order_token_verified, is_authenticated, has_linked_use
                 return {
                     "state": "token_invalid_linked_user",
                     "redirect": "/auth",
+                    "message": f"Login to the account linked with this order to view it."
                 }
             else:
                 return {
@@ -909,8 +988,9 @@ def determine_order_state(order_token_verified, is_authenticated, has_linked_use
             # Case 1b: No Linked User
             return {
                 "state": "token_invalid_no_linked_user",
-                "redirect": "resend_order_link",
-                "action": "resend_order_link"
+                "redirect": "/resend_order_link",
+                "action": "resend_order_link",
+                 "message": "Your order token is missing or invalid. You can resend the order link to your registered email.",
             }
     
     # Case 2: Valid orderToken
@@ -920,12 +1000,14 @@ def determine_order_state(order_token_verified, is_authenticated, has_linked_use
             return {
                 "state": "valid_token_unauthenticated_linked_user",
                 "redirect": "/auth",
-                "linkedUserEmail": linked_user_email
+                "linkedUserEmail": linked_user_email,
+                "message": f"Login to the account linked with this order ({linked_user_email}) to view it.",
             }
         else:
             return {
                 "state": "valid_token_unauthenticated_no_linked_user", 
                 "redirect": "/auth",
+                 "message": "Sign up to connect this order to your account.",
             }
     
     # Scenario 2b: Authenticated User
@@ -934,7 +1016,8 @@ def determine_order_state(order_token_verified, is_authenticated, has_linked_use
             return {
                 "state": "valid_token_authenticated_order_error",
                 "redirect": "/auth", 
-                "linkedUserEmail": linked_user_email
+                "linkedUserEmail": linked_user_email,
+                "message": f"This order is linked to another account ({linked_user_email}). Please log in with the correct account.",
             }
         else:
             return {
@@ -945,6 +1028,7 @@ def determine_order_state(order_token_verified, is_authenticated, has_linked_use
         return {
             "state": "valid_token_authenticated_no_linked_user",
             "redirect": f"/link-order",
+            "message": "Connect this order to your account."
         }
 
 @app.route("/get-order", methods=["POST", "GET"])
@@ -952,7 +1036,16 @@ def determine_order_state(order_token_verified, is_authenticated, has_linked_use
 def get_order():
     try:
         # First part: Original `get_order` functionality
+        #either use access token from supertokens
         user_id, _ = get_session_and_user_id(request)
+        user_id_from_dify = request.args.get("user_id_from_dify")
+        #or use temporary access token passed to dify
+        jwt_payload = validate_jwt(request.headers.get("Access-Token"))
+        if user_id == None:
+            if jwt_payload and jwt_payload.get("user_id") == user_id_from_dify:
+                user_id = jwt_payload.get("user_id") if jwt_payload else None
+            
+        print("user_id from get-order",user_id)    
         projection = {"orders": 1, "_id": 0}
         
         # Fetch necessary data
@@ -1017,7 +1110,7 @@ def get_order():
                 return jsonify({"error": "Order cannot be found"}), 404
             
             payment_method_id = orderData["payment_method"]
-            payment_method_data = stripe.PaymentMethod.retrieve(payment_method_id)
+            payment_method_data = stripe.PaymentMethod.retrieve(payment_method_id) if not user_id_from_dify else None
             
             # Second part: Integrate `get_orders` functionality
             order_items = orderData["order_items"]
@@ -1039,12 +1132,37 @@ def get_order():
                     return jsonify({"error": final_order_data["error"]}), 404
 
                 orderData["full_order_items"] = final_order_data["result"]
+                cleaned_order_data = {
+                    "customer": {
+                        "emailAddress": orderData["customer"]["emailAddress"],
+                        "name": orderData["customer"]["name"]
+                    },
+                    "full_order_items": [
+                        {
+                            "name": item["name"],
+                            "price": item["price"],
+                            "quantity": item["quantity"],
+                            "size": item["size"],
+                            "thumbnail": item["thumbnail"]
+                        } for item in orderData["full_order_items"]
+                    ],
+                    "order_date": orderData["order_date"],
+                    "order_number": orderData["order_number"],
+                    "shipping_address": {
+                        "city": orderData["shipping_address"]["city"],
+                        "country": orderData["shipping_address"]["country"],
+                        "line1": orderData["shipping_address"]["line1"],
+                        "postal_code": orderData["shipping_address"]["postal_code"]
+                    },
+                    "status": orderData["status"],
+                    "total_price": orderData["total_price"]
+                }
                 return jsonify({
                     "orderData": orderData,
                     "paymentData": payment_method_data,
                     "orderTokenVerified": order_token_verified,
                     "state": order_state["state"],
-                }), 200
+                } if not user_id_from_dify else {"orderData": cleaned_order_data}), 200
             except Exception as e:
                 return jsonify({"error": str(e)}), 500
     
@@ -1148,6 +1266,82 @@ def add_user():
     except Exception as e:
         print("Unexpected error during sign up:", e)
         return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
+
+@app.route("/send-order-link", methods=["POST"])
+def resend_order_link():
+    data = request.get_json()
+
+    # Check if the required fields (orderNumber and email) are present
+    orderNumber = data.get("orderNumber")
+    email = data.get("email")
+    if not email or not orderNumber:
+        return jsonify({"error": "Please provide both your email and order number to proceed."}), 400
+
+    try:
+        # Generate a new token for the order
+        newToken = generate_token(orderNumber)
+
+        # Update the order in MongoDB with the new token
+        update_result = ordersCollection.update_one({"_id": orderNumber}, {"$set": {"order_token": newToken}})
+        
+        # If no documents were updated, return an error
+        if update_result.matched_count == 0:
+            return jsonify({"error": "Order not found. Please check the order number and try again."}), 404
+
+        # Fetch the order data
+        raw_order_data = get_order_data(orderNumber, {})
+        if not raw_order_data:
+            return jsonify({"error": "If the details provided are correct, you will receive a link shortly."}), 404
+
+        orderData = json.loads(raw_order_data)
+        emailFromOrder = orderData.get("customer", {}).get("emailAddress")
+        
+        # Check if the email is present in the order data
+        if not emailFromOrder:
+            return jsonify({"error": "We encountered an issue retrieving your order information. Please try again later."}), 500
+
+        # Validate email with the one provided
+        if email != emailFromOrder:
+            return jsonify({"error": "The provided email does not match the one used during checkout. Please check and try again."}), 400
+
+        # Prepare email payload for sending
+        email_payload = {
+            "sender": "tan_xuan_yi_caleb@students.edu.sg",
+            "recipients": [email],
+            "template_id": "8449130",
+            "template_data": {
+                "product_name": "Jesus-Shirt-Project",
+                "orders_url": f'http://localhost:3000/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
+                "payment": orderData["payment_id"],
+                "shipping": orderData["shipping_cost"],
+                "email": emailFromOrder,
+                "address_line_name": orderData["customer"]["name"],
+                "address_line_street": orderData["shipping_address"]["line1"],
+                "address_line_city": orderData["shipping_address"]["city"],
+                "address_line_state_country": f'{orderData["shipping_address"]["state"]}, {orderData["shipping_address"]["country"]}',
+                "order_id": orderData["_id"],
+                "items": orderData["order_items"],
+                "total": orderData["total_price"],
+            },
+        }
+
+        # Send the email
+        """
+        emailRes = handle_send_email(smtp2GoClient, email_payload)
+        
+        # Check if the email was sent successfully
+        if emailRes.get("status") != "success":
+            return jsonify({"error": "We couldn't send the email at this time. Please try again later."}), 500
+        """
+        return jsonify({"message": "A new order link has been sent to your email."}), 200
+
+    except KeyError as e:
+        return jsonify({"error": f"Missing required field: {str(e)}. Please try again later."}), 400
+    except Exception as e:
+        print(e)
+        return jsonify({"error": f"An unexpected error occurred. Please try again later."}), 500
+
+
 
 @app.route("/login-from-verify-email", methods=["POST"])
 @authenticate_firebase_token
@@ -1493,7 +1687,52 @@ def resend_verification_email():
         else:
             # Return a generic error message for other exceptions
             return jsonify({"error": "Failed to send verification email. Please try again."}), 500
+        
+@app.route('/send-dify-chat-message', methods=['POST'])
+def send_dify_chat_message():
+    DIFY_API_URL = "http://localhost/v1/chat-messages"
+    user_id, session = get_session_and_user_id(request)
 
+    # Get the user ID and other inputs from the request body
+    query = request.json.get('query')
+    inputs = request.json.get('inputs', {})
+    conversation_id = request.json.get('conversation_id',"")
+
+    # Add the access_token to the inputs
+    if user_id:
+        inputs['access_token'] = generate_jwt(user_id)
+    print("Inputs",inputs)
+    # Prepare the request payload
+    payload = {
+        "query": query,
+        "inputs": inputs,
+        "response_mode": "blocking",  # Or "blocking", depending on your preference
+        "user": None if conversation_id == "" else user_id,
+        "conversation_id": conversation_id,
+    }
+    
+    print("Payload:",payload)
+
+    # Set the headers with the Dify API key for authentication
+    headers = {
+        'Authorization': f'Bearer {dify_api_key}',  # Use the API key directly in the header
+        'Content-Type': 'application/json'
+    }
+
+    try:
+        # Make the POST request to the Dify API
+        response = requests.post(DIFY_API_URL, json=payload, headers=headers)
+        # Check if the request was successful
+        if response.status_code == 200:
+            data = response.json()
+            print(data["answer"])
+            return jsonify({"answer":data["answer"],"conversation_id":data["conversation_id"]}), 200  # Return the response from the Dify API
+        else:
+            return jsonify({"error": "Failed to send message"}), response.status_code
+
+    except Exception as e:
+        print("error from dify", str(e))
+        return jsonify({"error": str(e)}), 500
     
     
 if __name__ == "__main__":
