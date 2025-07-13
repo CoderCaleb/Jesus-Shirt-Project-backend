@@ -25,6 +25,7 @@ from supertokens_python.recipe.session.syncio import get_session
 import jwt
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv, dotenv_values 
+from livekit import api
 
 load_dotenv() 
 from supertokens_python import init, InputAppInfo, SupertokensConfig
@@ -296,7 +297,7 @@ init(
             ),
             email_delivery=EmailDeliveryConfig(override=custom_email_deliver)
         )
-    ]
+    ],
 )
 
 
@@ -508,6 +509,8 @@ def authenticate_order_token_function(order_token, order_number):
 def authenticate_order_token(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
+        print("json payload get_order:",request.args)
+
         g.order_info = "token-invalid"
         order_token = request.headers.get('Order-Token')
         order_id = request.args.get("orderNumber") or (request.json and request.json.get("orderNumber"))
@@ -1037,6 +1040,7 @@ def get_order():
     try:
         # First part: Original `get_order` functionality
         #either use access token from supertokens
+        print("json payload get_order:",request.args)
         user_id, _ = get_session_and_user_id(request)
         user_id_from_dify = request.args.get("user_id_from_dify")
         #or use temporary access token passed to dify
@@ -1099,7 +1103,8 @@ def get_order():
                 "error": "An error occurred when fetching order",
                 "state": order_state["state"],
                 "redirect": order_state["redirect"],
-                "linkedUserEmail": order_state.get("linkedUserEmail")
+                "linkedUserEmail": order_state.get("linkedUserEmail"),
+                "orderNumber":orderNumber
             }), 401 if "auth" in order_state["redirect"] else 403
         
         # If action is to display order
@@ -1695,7 +1700,7 @@ def send_dify_chat_message():
 
     # Get the user ID and other inputs from the request body
     query = request.json.get('query')
-    inputs = request.json.get('inputs', {})
+    inputs = request.json.get('inputs', {}) ## to pass jwt
     conversation_id = request.json.get('conversation_id',"")
 
     # Add the access_token to the inputs
@@ -1706,8 +1711,8 @@ def send_dify_chat_message():
     payload = {
         "query": query,
         "inputs": inputs,
-        "response_mode": "blocking",  # Or "blocking", depending on your preference
-        "user": None if conversation_id == "" else user_id,
+        "response_mode": "blocking",
+        "user": generate_guest_uid() if not user_id else user_id,
         "conversation_id": conversation_id,
     }
     
@@ -1728,12 +1733,80 @@ def send_dify_chat_message():
             print(data["answer"])
             return jsonify({"answer":data["answer"],"conversation_id":data["conversation_id"]}), 200  # Return the response from the Dify API
         else:
+            print(response.text)
             return jsonify({"error": "Failed to send message"}), response.status_code
 
     except Exception as e:
         print("error from dify", str(e))
         return jsonify({"error": str(e)}), 500
     
+@app.route('/get_connection_details', methods=['GET'])
+def get_connection_details():
+    try:
+        LIVEKIT_URL = os.getenv("LIVEKIT_URL")
+        API_KEY = os.getenv("LIVEKIT_API_KEY")
+        API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+        
+        user_id, session = get_session_and_user_id(request)
+        
+        short_lived_jwt = None
+        
+        if user_id:
+            short_lived_jwt = generate_jwt(user_id)
+
+        if not LIVEKIT_URL:
+            raise ValueError("LIVEKIT_URL is not defined")
+        if not API_KEY:
+            raise ValueError("LIVEKIT_API_KEY is not defined")
+        if not API_SECRET:
+            raise ValueError("LIVEKIT_API_SECRET is not defined")
+
+        # Generate participant identity and room name
+        guest_participant_identity = f"guest_user_{random.randint(0, 9999)}"
+        room_name = f"voice_assistant_room_{random.randint(0, 9999)}"
+
+        # Generate participant token
+        participant_token = create_participant_token({"identity": user_id if user_id else guest_participant_identity}, room_name, short_lived_jwt)
+        print("jwt token:", participant_token) 
+        # Return connection details
+        data = {
+            "serverUrl": LIVEKIT_URL,
+            "roomName": room_name,
+            "participantToken": participant_token,
+            "participantName": user_id if user_id else guest_participant_identity,
+        }
+        return jsonify(data), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def create_participant_token(user_info, room_name, short_lived_jwt):
+    API_KEY = os.getenv("LIVEKIT_API_KEY")
+    API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+    try:
+        token = api.AccessToken(API_KEY, API_SECRET) \
+        .with_identity(user_info.get("identity", "default_identity")) \
+        .with_ttl(900)  \
+        .with_metadata(json.dumps({"access_token":short_lived_jwt})) \
+
+        # Add video grants
+        grants = api.VideoGrants(
+            room=room_name,
+            room_join=True,
+            can_publish=True,
+            can_publish_data=True,
+            can_subscribe=True
+        )
+        token.with_grants(grants)
+
+        return token.to_jwt()
+    except Exception as e:
+        print(e)
+    
+    
+def generate_guest_uid():
+    return 'guest-' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=9))
     
 if __name__ == "__main__":
     app.run(port=4242, debug=True)
