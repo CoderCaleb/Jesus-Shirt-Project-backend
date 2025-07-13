@@ -311,8 +311,8 @@ cred = firebase_admin.credentials.Certificate(
 )
 firebase_admin.initialize_app(cred)
 
-stripe.api_key = "sk_test_51OOBnGEvVCl2vla1w7zQ4XYBPSUslUZvifWMvfr2iji0OcoZQzfS39yYA6et6v9jKkb35D5040HdwHAvQ4fUfN7p005LTIQPJ5"
-dify_api_key = "app-lOS6ArmsRqAhLXIkptRg1idM"
+stripe.api_key = os.getenv("STRIPE_API_KEY")
+dify_api_key = os.getenv("DIFY_API_KEY")
 
 app = Flask(
     __name__, static_folder="public", static_url_path="", template_folder="public"
