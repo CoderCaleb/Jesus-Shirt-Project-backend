@@ -28,3 +28,5 @@ livekit==0.20.1
 livekit-api==0.8.1
 livekit-agents==0.12.15
 livekit-protocol==0.8.0
+
+python-dateutil==2.8.2
