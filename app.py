@@ -283,7 +283,7 @@ init(
     supertokens_config=SupertokensConfig(
         # These are the connection details of the app you created on supertokens.com
         connection_uri="https://st-dev-fa4c9ec0-a64e-11ef-b465-eb3968890c51.aws.supertokens.io",
-        api_key="x2nlb4UxdyirYqtamYpfjOc-fn"
+        api_key=os.getenv("SUPERTOKENS_API_KEY")
     ),
     framework="flask",
     recipe_list=[
@@ -317,7 +317,7 @@ dify_api_key = os.getenv("DIFY_API_KEY")
 app = Flask(
     __name__, static_folder="public", static_url_path="", template_folder="public"
 )
-app.config['SECRET_KEY'] = "0fb36cffb99bb06e51deeab7b1d5a5952d99c635b6ebf5dbb0f667b0277088135a7a73106542517e0975b36acf6157c6be271c43e3e89846110e24bd51a8b430"
+app.config['SECRET_KEY'] = os.getenv("JWT_SECRET_KEY")
 Middleware(app)
 
 CORS(
@@ -341,7 +341,7 @@ def catch_all(u_path: str):
     abort(404)
 TOKEN = "vVSC6FE0b1G4RGuBQ1EnRti9eh87a7Lc0qMlCPIy"
 headers = {"Content-Type": "application/json", "Authorization": f"Bearer {TOKEN}"}
-mongo_connection = "mongodb+srv://caleb:msl22083b@jesus-shirt-project.weyhmji.mongodb.net/mydatabase?retryWrites=true&w=majority&appName=Jesus-Shirt-Project"
+mongo_connection = os.getenv("MONGO_CONNECTION")
 client = MongoClient(mongo_connection)
 shopDB = client["shop"]
 productsCollection = shopDB["products"]
@@ -1486,9 +1486,7 @@ def handle_payment_intent_succeeded(payment_intent):
         return {"error": "HTTP request failed"}
 
 
-endpoint_secret = (
-    "whsec_10e8fd7fe0294f3ad3ec08186ec0ab93be59a9e646ff25b2ce1db8fe97039948"
-)
+endpoint_secret = os.getenv("STRIPE_ENDPOINT_SECRET")
 
 
 @app.route("/stripe_webhook", methods=["POST"])
