@@ -8,9 +8,6 @@ import requests
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from functools import wraps
-import firebase_admin
-from firebase_admin import auth as firebase_auth
-from firebase_admin.exceptions import FirebaseError
 import time
 import secrets
 import hashlib
@@ -306,11 +303,6 @@ SMTP_API_TOKEN = os.getenv("SMTP-API-TOKEN")
 
 smtp2GoClient = Smtp2goClient(api_key=SMTP_API_TOKEN)
 
-cred = firebase_admin.credentials.Certificate(
-    "jesus-shirt-project-firebase-adminsdk-o18sq-9eb6ed6989.json"
-)
-firebase_admin.initialize_app(cred)
-
 stripe.api_key = os.getenv("STRIPE_API_KEY")
 dify_api_key = os.getenv("DIFY_API_KEY")
 
@@ -541,48 +533,6 @@ def authenticate_order_token(f):
 
         return f(*args, **kwargs)
 
-
-    return decorated_function  
-
-def authenticate_firebase_token(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        id_token = request.headers.get("Authorization")
-        uid = request.args.get("uid") or (request.json and request.json.get("uid"))
-        request.user = None
-
-        if id_token and id_token.startswith("Bearer ") and id_token.split("Bearer ")[1] != "false" and id_token.split("Bearer ")[1] != "null":
-            id_token = id_token.split("Bearer ")[1]
-
-            try:
-                decoded_token = firebase_auth.verify_id_token(id_token, clock_skew_seconds=5)
-                print(decoded_token)
-                email_verified = decoded_token.get('email_verified', False)
-                
-                if hasattr(request, 'url_rule') and hasattr(request.url_rule, 'rule'):
-                    if not email_verified and (request.url_rule.rule != "/add-user"):
-                        raise ValueError("Email is not verified.")
-                else:
-                    print(f"request.url_rule: {request.url_rule}")
-                
-                request.user = decoded_token
-
-                if not uid:
-                    raise ValueError("No UID was provided")
-
-                if uid != decoded_token["uid"]:
-                    raise ValueError("UID mismatch")
-                    
-            except Exception as e:
-                print("error from auth:", e)
-                if hasattr(request, 'url_rule') and hasattr(request.url_rule, 'rule'):
-                    if request.url_rule.rule == "/add-user":
-                        firebase_auth.delete_user(uid)
-                else:
-                    print(f"request.url_rule: {request.url_rule}")
-                return jsonify({"error":str(e)}), 401
-
-        return f(*args, **kwargs)
 
     return decorated_function
 
@@ -1178,39 +1128,7 @@ def get_order():
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
-@app.route("/add-order-to-user", methods=["POST"])
-@authenticate_firebase_token
-def add_order_to_user():
-    user = request.user
 
-    if not user:
-        return jsonify({"error": "User not authorized"}), 401
-    try:
-        data = json.loads(request.data)
-        orderId = data.get("orderId")
-        uid = data.get("uid")
-        result = usersCollection.update_one(
-            {"uid": uid}, {"$push": {"orders": orderId}}
-        )
-        return jsonify({"message": "Order added to user successfully"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-def send_email_verification(email,navigatedFrom, orderId):
-    action_code_settings = firebase_auth.ActionCodeSettings(url=f"http://localhost:3000/login?email={email}&from={navigatedFrom}&orderId={orderId}",handle_code_in_app=True)
-    email_verification_link = firebase_auth.generate_email_verification_link(email, action_code_settings=action_code_settings)
-    print("email_verification_link:",email_verification_link)
-    email_payload = {
-        "sender": "tan_xuan_yi_caleb@students.edu.sg",
-        "recipients": [email],
-        "template_id": "0762399",
-        "template_data": {
-            "product_name": "Jesus-Shirt-Project",
-            "confirm_url": email_verification_link,
-        },
-        "custom_headers": {"Your-Custom-Headers": "Custom Values"}
-    }
-    ##handle_send_email(smtp2GoClient, email_payload)
 @app.route("/link-order", methods=["POST"])
 @verify_session()
 @authenticate_order_token
@@ -1346,110 +1264,6 @@ def resend_order_link():
         print(e)
         return jsonify({"error": f"An unexpected error occurred. Please try again later."}), 500
 
-
-
-@app.route("/login-from-verify-email", methods=["POST"])
-@authenticate_firebase_token
-def handle_verify_email():
-    data = request.get_json()
-    user = request.user
-    userUID = user["uid"]
-    
-    if not user:
-        return jsonify({"error": "User not authorized"}), 401
-    
-    try:
-        update_verification_status_result = usersCollection.update_one({"uid": userUID}, {"$set": {"emailVerified": True, "email":user["email"]}})
-        
-        if update_verification_status_result.matched_count == 0:
-            return jsonify({"error": "User not found in the database."}), 404
-        
-        return jsonify({"message": "Email verified successfully."}), 200
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": "Failed to verify email: " + str(e)}), 500
-       
-@app.route("/login-with-state", methods=["POST"])
-@authenticate_firebase_token
-@authenticate_order_token
-def handle_login_with_state():
-    user = request.user
-    data = json.loads(request.data)
-    orderId = data.get('orderNumber', None)
-    state = data.get("state", None)
-    
-    if not user:
-        return jsonify({"error": "User not authorized"}), 401
-
-    try:
-        def callback(session):
-            order_data = json.loads(get_order_data(orderId, {"_id": 0, "linked_user": 1}))
-            linkedUser = order_data.get("linked_user") if order_data else None
-            
-            if g.order_info in ["token-invalid", "no-token-provided"]:
-                print("g.order_info:",g.order_info)
-                raise ValueError("Invalid order token")
-            ##have linked user  
-            if state in ["authenticated-order-not-in-user-linked-user-not-matched", "not-authenticated-has-linked-user","authenticated-failed-no-order-token","authenticated-order-token-invalid"]:
-                if linkedUser != user["uid"]:
-                    raise ValueError("The account you are trying to login does not match the one associated with order.")
-            ##no linked user
-            elif state in ["not-authenticated-no-linked-user", "authenticated-no-linked-user"]:
-                addOrderToUserResult = usersCollection.update_one(
-                    {"uid": user["uid"]},
-                    {"$push": {"orders": orderId}},
-                    session=session
-                )
-                if addOrderToUserResult.modified_count == 0:
-                    raise ValueError("Failed to add order to user")
-                
-                addUserToOrder = ordersCollection.update_one(
-                    {"_id": orderId},
-                    {"$set": {"linked_user": user["uid"]}},
-                    session=session
-                )
-                if addUserToOrder.modified_count == 0:
-                    raise ValueError("Failed to add user to order")
-        
-        with client.start_session() as session:
-            session.with_transaction(callback)
-            return jsonify({"message": "success"}), 200
-            
-    except ValueError as e:
-        traceback.print_exc()        
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        traceback.print_exc()        
-        return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500   
-
-@app.route("/get-user")
-@authenticate_firebase_token
-def get_user():
-    user = request.user
-    data = request.args
-    projection = json.loads(data.get("projection",None))
-    print(projection)
-    if not user:
-        return jsonify({"error": "User not authorized"}), 401
-    try:
-        user = request.user
-
-        userData = get_user_data(user["uid"], projection)
-        if is_dict_empty(userData):
-            return jsonify({"error": "User cannot be found"}), 404
-        
-        print(userData)
-        userData = JSONEncoder().encode(userData)
-        return userData, 200
-
-    except ValueError as ve:
-        return jsonify({"error": "Invalid JSON data"}), 400
-    except Exception as e:
-        print(e)
-        return jsonify({"error": str(e)}), 500
-
-
 def handle_payment_intent_succeeded(payment_intent):
     print("PI metadata:", payment_intent["metadata"])
     order_data = {
@@ -1562,134 +1376,6 @@ def get_orders():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-@app.route('/update-profile', methods=['POST'])
-@authenticate_firebase_token
-def update_profile():
-    data = request.get_json()
-    profile_changes = data.get('profileChanges')
-    user = request.user
-    fields_to_validate = ["name", "birthday", "clothingPreference"]
-    print("profileChanges:", profile_changes)
-
-    errors = validate_fields(profile_changes.keys(), profile_changes)
-    if errors:
-        return jsonify({'errors': errors}), 400
-    
-    if not user:
-        return jsonify({'error': 'User not authorized'}), 401
-
-    if not profile_changes:
-        return jsonify({'error': 'Invalid input'}), 400
-    
-        # Filter profile_changes to include only the allowed keys
-    allowed_keys = ["name", "birthday", "clothingPreference"]
-    filtered_changes = {key: value for key, value in profile_changes.items() if key in allowed_keys}
-
-    # Ensure there are filtered changes to update
-    if not filtered_changes:
-        return jsonify({'error': 'No valid fields to update'}), 400
-
-    # Update the user profile in the database
-    result = usersCollection.update_one(
-        {'uid': user["uid"]},
-        {'$set': profile_changes}
-    )
-
-    if result.matched_count == 0:
-        return jsonify({'error': 'User not found'}), 404
-
-    return jsonify({'data': profile_changes}), 200
-
-@app.route("/update-email", methods=["POST"])
-@authenticate_firebase_token
-def update_email():
-    data = request.get_json()
-    newEmail = data.get("newEmail")
-    user = request.user
-    userUID = user["uid"]
-    
-    if not user:
-        return jsonify({"error": "User not authorized"}), 401
-    
-    if not newEmail:
-        return jsonify({"error": "A new email must be provided"}), 400
-    
-    try:
-        def callback(session):
-            try:
-                # Attempt to update the user's email in Firebase Authentication
-                user_record = firebase_auth.update_user(userUID, email=newEmail, email_verified=False)
-            except firebase_auth.EmailAlreadyExistsError:
-                raise ValueError("The new email address is already in use by another account.")
-            except ValueError as e:
-                # Handle specific ValueError related to invalid user ID or properties
-                raise ValueError("Invalid user ID or properties: " + str(e))
-            except FirebaseError as e:
-                # Handle general Firebase errors
-                raise ValueError("Failed to update email in Firebase Authentication: " + str(e))
-            
-            try:
-                updateEmailResult = usersCollection.update_one({"uid": userUID}, {
-                    "$set": {"email": newEmail, "emailVerified": False}
-                }, session=session)
-                
-                if updateEmailResult.matched_count == 0:
-                    # Rollback Firebase update if MongoDB update fails
-                    firebase_auth.update_user(userUID, email=user["email"], email_verified=user["emailVerified"])
-                    raise ValueError("User not found in MongoDB")
-            except PyMongoError as e:
-                # Rollback Firebase update if MongoDB update fails
-                firebase_auth.update_user(userUID, email=user["email"], email_verified=user["emailVerified"])
-                raise ValueError("Failed to update email in database: " + str(e))
-            
-            try:
-                send_email_verification(newEmail, "change-email", None)
-            except Exception as e:
-                # Rollback both Firebase and MongoDB updates if email verification fails
-                firebase_auth.update_user(userUID, email=user["email"], email_verified=user["emailVerified"])
-                usersCollection.update_one({"uid": userUID}, {
-                    "$set": {"email": user["email"], "emailVerified": user["emailVerified"]}
-                }, session=session)
-                raise ValueError("Failed to send email verification: " + str(e))
-            
-            return {"status": "success"}
-
-        with client.start_session() as session:
-            result = session.with_transaction(callback)
-            return jsonify(result), 200
-    except Exception as e:
-        print(e)
-        return jsonify({'error': str(e)}), 500
-    
-@app.route("/resend-verification-email", methods=["POST"])
-def resend_verification_email():
-    # Extract data from the request
-    data = request.get_json()
-    email = data.get("email")
-    navigatedFrom = data.get("navigatedFrom")
-    orderId = data.get("orderId")
-
-    # Input validation
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
-    if not navigatedFrom:
-        return jsonify({"error": "NavigatedFrom is required"}), 400
-
-    try:
-        # Call the function to send the email
-        send_email_verification(email, navigatedFrom, orderId)
-        return jsonify({"message": "Verification email sent successfully!"}), 200
-    except Exception as e:
-        error_message = str(e)
-        print(error_message)  # Log the error for debugging
-
-        # Check for specific error message
-        if "TOO_MANY_ATTEMPTS_TRY_LATER" in error_message:
-            return jsonify({"error": "Too many attempts, please try again later."}), 429  # 429 Too Many Requests
-        else:
-            # Return a generic error message for other exceptions
-            return jsonify({"error": "Failed to send verification email. Please try again."}), 500
         
 @app.route('/send-dify-chat-message', methods=['POST'])
 def send_dify_chat_message():
