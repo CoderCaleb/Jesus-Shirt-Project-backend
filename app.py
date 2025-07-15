@@ -321,7 +321,7 @@ CORS(
                 "https://jesus-shirt-shop.netlify.app",  # Production frontend
                 "http://localhost:3001",  # Additional local frontend
                 "http://localhost", # dify
-                "https://jesus-shirt-projec-git-dbde9b-xxgoldenprozxx-gmailcoms-projects.vercel.app/checkout" #vercel live website
+                "https://jesus-shirt-projec-git-dbde9b-xxgoldenprozxx-gmailcoms-projects.vercel.app" #vercel live website
             ]
         }
     },
