@@ -50,6 +50,10 @@ from supertokens_python.recipe.passwordless.types import EmailDeliveryOverrideIn
 from typing import Dict, Any
 from supertokens_python.ingredients.emaildelivery.types import EmailDeliveryConfig
 
+website_domain = os.getenv("WEBSITE_DOMAIN")
+api_domain = os.getenv("API_DOMAIN")
+dify_domain = os.getenv("DIFY_DOMAIN")
+
 def custom_email_deliver(original_implementation: EmailDeliveryOverrideInput) -> EmailDeliveryOverrideInput:
     original_send_email = original_implementation.send_email
 
@@ -272,8 +276,8 @@ def override_passwordless_apis(original_implementation: APIInterface):
 init(
     app_info=InputAppInfo(
         app_name="Jesus Shirt Project",
-        api_domain="http://localhost:4242",
-        website_domain="http://localhost:3000",
+        api_domain=api_domain,
+        website_domain=website_domain,
         api_base_path="/auth",
         website_base_path="/auth"
     ),
@@ -321,7 +325,7 @@ CORS(
                 "https://jesus-shirt-shop.netlify.app",  # Production frontend
                 "http://localhost:3001",  # Additional local frontend
                 "http://localhost", # dify
-                "https://jesus-shirt-projec-git-dbde9b-xxgoldenprozxx-gmailcoms-projects.vercel.app" #vercel live website
+                website_domain #vercel live website
             ]
         }
     },
@@ -761,7 +765,7 @@ def process_order(session, orderData):
     "template_id": "8449130",
     "template_data": {
         "product_name": "Jesus-Shirt-Project",
-        "orders_url": f'http://localhost:3000/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
+        "orders_url": f'{website_domain}/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
         "payment": orderData["payment_id"],
         "shipping": orderData["shipping_cost"],
         "email": orderData["customer"]["emailAddress"],
@@ -1235,7 +1239,7 @@ def resend_order_link():
             "template_id": "8449130",
             "template_data": {
                 "product_name": "Jesus-Shirt-Project",
-                "orders_url": f'http://localhost:3000/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
+                "orders_url": f'{website_domain}/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
                 "payment": orderData["payment_id"],
                 "shipping": orderData["shipping_cost"],
                 "email": emailFromOrder,
@@ -1287,7 +1291,7 @@ def handle_payment_intent_succeeded(payment_intent):
 
     try:
         response = requests.post(
-            "http://127.0.0.1:4242/place-order",
+            f"{api_domain}/place-order",
             json={"orderData": order_data, "uid": order_data["linked_user"]},
         )
         if response.status_code != 200:
@@ -1380,7 +1384,7 @@ def get_orders():
         
 @app.route('/send-dify-chat-message', methods=['POST'])
 def send_dify_chat_message():
-    DIFY_API_URL = "http://localhost/v1/chat-messages"
+    DIFY_API_URL = f"{dify_domain}/v1/chat-messages"
     user_id, session = get_session_and_user_id(request)
 
     # Get the user ID and other inputs from the request body
