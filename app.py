@@ -288,7 +288,7 @@ init(
     ),
     framework="flask",
     recipe_list=[
-        session.init(), # initializes session features
+        session.init(cookie_same_site='none'), # initializes session features
         passwordless.init(
             flow_type="MAGIC_LINK",
             contact_config=ContactEmailOnlyConfig(),
@@ -325,13 +325,15 @@ CORS(
                 "https://jesus-shirt-shop.netlify.app",  # Production frontend
                 "http://localhost:3001",  # Additional local frontend
                 "http://localhost", # dify
-                website_domain #vercel live website
+                website_domain, #vercel live website
             ]
         }
     },
     supports_credentials=True,  # Required for SuperTokens sessions (cookies)
     allow_headers=["Content-Type","Order-Token","orderNumber","state","Access-Token"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
 )
+
+print(website_domain, api_domain)
 @app.route('/', defaults={'u_path': ''})  
 @app.route('/<path:u_path>')  
 def catch_all(u_path: str):
