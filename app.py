@@ -435,10 +435,11 @@ def generate_jwt(user_id):
     """
     Generate a JWT for the user.
     """
+    now = datetime.now(timezone.utc)
     payload = {
         'user_id': user_id,
-        'exp': datetime.now(timezone.utc) + timedelta(minutes=15),  # 15 minutes expiry
-        'iat': datetime.now(timezone.utc)
+        'exp': int((now + timedelta(minutes=15)).timestamp()),
+        'iat': now.timestamp()
     }
     secret_key = current_app.config['SECRET_KEY']
     return jwt.encode(payload, secret_key, algorithm='HS256')
