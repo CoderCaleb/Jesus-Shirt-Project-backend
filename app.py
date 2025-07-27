@@ -768,24 +768,25 @@ def process_order(session, orderData):
     update_stripe_metadata(orderData["payment_id"], metadata)
     
     email_payload = {
-    "sender": "tan_xuan_yi_caleb@students.edu.sg",
-    "recipients": [orderData["customer"]["emailAddress"]],
-    "template_id": "8449130",
-    "template_data": {
-        "product_name": "Jesus-Shirt-Project",
-        "orders_url": f'{website_domain}/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
-        "payment": orderData["payment_id"],
-        "shipping": orderData["shipping_cost"],
-        "email": orderData["customer"]["emailAddress"],
-        "address_line_name": orderData["customer"]["name"],
-        "address_line_street": orderData["shipping_address"]["line1"],
-        "address_line_city": orderData["shipping_address"]["city"],
-        "address_line_state_country": orderData["shipping_address"]["state"] + ", " + orderData["shipping_address"]["country"],
-        "order_id": orderData["_id"],
-        "items": orderData["order_items"],
-        "total": orderData["total_price"]
-    },
-}
+        "sender": "noreply@jesus-shirt-project.shop",
+        "recipients": [orderData["customer"]["emailAddress"]],
+        "template_id": "8449130",
+        "template_data": {
+            "product_name": "Jesus-Shirt-Project",
+            "orders_url": f'{website_domain}/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
+            "payment": orderData["payment_id"],
+            "shipping": orderData["shipping_cost"],
+            "email": orderData["customer"]["emailAddress"],
+            "address_line_name": orderData["customer"]["name"],
+            "address_line_street": orderData["shipping_address"]["line1"],
+            "address_line_city": orderData["shipping_address"]["city"],
+            "address_line_state_country": orderData["shipping_address"]["state"] + ", " + orderData["shipping_address"]["country"],
+            "order_id": orderData["_id"],
+            "items": orderData["order_items"],
+            "total": orderData["total_price"]
+        },
+    }
+
  
     emailRes = handle_send_email(smtp2GoClient, email_payload)
     print("emailRes",emailRes)
@@ -1242,7 +1243,7 @@ def resend_order_link():
 
         # Prepare email payload for sending
         email_payload = {
-            "sender": "tan_xuan_yi_caleb@students.edu.sg",
+            "sender": "noreply@jesus-shirt-project.shop",
             "recipients": [email],
             "template_id": "8449130",
             "template_data": {
