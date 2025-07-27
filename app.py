@@ -288,7 +288,7 @@ init(
     ),
     framework="flask",
     recipe_list=[
-        session.init(cookie_same_site='none'), # initializes session features
+        session.init(), # initializes session features
         passwordless.init(
             flow_type="MAGIC_LINK",
             contact_config=ContactEmailOnlyConfig(),
@@ -1500,4 +1500,4 @@ def generate_guest_uid():
     return 'guest-' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=9))
     
 if __name__ == "__main__":
-    app.run(port=4242, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 4242)), debug=True)
