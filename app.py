@@ -1401,7 +1401,7 @@ def send_dify_chat_message():
     conversation_id = request.json.get('conversation_id',"")
 
     # Add the access_token to the inputs
-    if user_id:
+    if user_id != None and session != None:
         inputs['access_token'] = generate_jwt(user_id)
     print("Inputs",inputs)
     # Prepare the request payload
