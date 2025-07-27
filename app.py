@@ -1486,7 +1486,7 @@ def create_participant_token(user_info, room_name, short_lived_jwt):
     try:
         token = api.AccessToken(API_KEY, API_SECRET) \
         .with_identity(user_info.get("identity", "default_identity")) \
-        .with_ttl(900)  \
+        .with_ttl(timedelta(seconds=900))  \
         .with_metadata(json.dumps({"access_token":short_lived_jwt})) \
 
         # Add video grants
