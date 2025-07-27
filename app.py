@@ -1498,7 +1498,7 @@ def create_participant_token(user_info, room_name, short_lived_jwt):
             can_subscribe=True
         )
         token.with_grants(grants)
-        print("Livekit token",token)
+        print("Livekit token",token, "Livekit JWT", token.to_jwt())
 
         return token.to_jwt()
     except Exception as e:
