@@ -439,7 +439,7 @@ def generate_jwt(user_id):
     payload = {
         'user_id': user_id,
         'exp': int((now + timedelta(minutes=15)).timestamp()),
-        'iat': now.timestamp()
+        'iat': int(now.timestamp())
     }
     print("now type:", type(now), "value:", now)
     print("timedelta type:", type(timedelta(minutes=15)), "value:", timedelta(minutes=15))
@@ -1498,13 +1498,17 @@ def create_participant_token(user_info, room_name, short_lived_jwt):
             can_subscribe=True
         )
         token.with_grants(grants)
+        print("Livekit token",token)
         print("Livekit token",token, "Livekit JWT", token.to_jwt())
 
         return token.to_jwt()
     except Exception as e:
         print(e)
-    
-    
+        
+@app.route("/healthz", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
 def generate_guest_uid():
     return 'guest-' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=9))
     
