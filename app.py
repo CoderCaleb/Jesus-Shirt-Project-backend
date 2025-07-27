@@ -441,6 +441,11 @@ def generate_jwt(user_id):
         'exp': int((now + timedelta(minutes=15)).timestamp()),
         'iat': now.timestamp()
     }
+    print("now type:", type(now), "value:", now)
+    print("timedelta type:", type(timedelta(minutes=15)), "value:", timedelta(minutes=15))
+
+    result = now + timedelta(minutes=15)
+    print("result type:", type(result), "value:", result)
     secret_key = current_app.config['SECRET_KEY']
     return jwt.encode(payload, secret_key, algorithm='HS256')
 
