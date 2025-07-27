@@ -1262,13 +1262,13 @@ def resend_order_link():
         }
 
         # Send the email
-        """
+        
         emailRes = handle_send_email(smtp2GoClient, email_payload)
         
         # Check if the email was sent successfully
         if emailRes.get("status") != "success":
             return jsonify({"error": "We couldn't send the email at this time. Please try again later."}), 500
-        """
+
         return jsonify({"message": "A new order link has been sent to your email."}), 200
 
     except KeyError as e:
