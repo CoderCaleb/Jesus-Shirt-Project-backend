@@ -1448,8 +1448,10 @@ def get_connection_details():
         
         short_lived_jwt = None
         
-        if user_id:
+        if user_id != None and session != None:
             short_lived_jwt = generate_jwt(user_id)
+            
+        print("short lived jwt",short_lived_jwt)    
 
         if not LIVEKIT_URL:
             raise ValueError("LIVEKIT_URL is not defined")
@@ -1496,6 +1498,7 @@ def create_participant_token(user_info, room_name, short_lived_jwt):
             can_subscribe=True
         )
         token.with_grants(grants)
+        print("Livekit token",token)
 
         return token.to_jwt()
     except Exception as e:
