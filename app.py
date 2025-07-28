@@ -782,11 +782,11 @@ def process_order(session, orderData):
             "address_line_city": orderData["shipping_address"]["city"],
             "address_line_state_country": orderData["shipping_address"]["state"] + ", " + orderData["shipping_address"]["country"],
             "order_id": orderData["_id"],
-            "items": orderData["order_items"],
-            "total": orderData["total_price"]
+            "items": json.loads(orderData["order_items"]),
+            "total": "{:.2f}".format(orderData["total_price"] / 100),
         },
     }
-
+    print("Email Payload after order",email_payload)
  
     emailRes = handle_send_email(smtp2GoClient, email_payload)
     print("emailRes",emailRes)
@@ -1203,80 +1203,6 @@ def add_user():
     except Exception as e:
         print("Unexpected error during sign up:", e)
         return jsonify({"error": "An unexpected error occurred", "details": str(e)}), 500
-
-@app.route("/send-order-link", methods=["POST"])
-def resend_order_link():
-    data = request.get_json()
-
-    # Check if the required fields (orderNumber and email) are present
-    orderNumber = data.get("orderNumber")
-    email = data.get("email")
-    if not email or not orderNumber:
-        return jsonify({"error": "Please provide both your email and order number to proceed."}), 400
-
-    try:
-        # Generate a new token for the order
-        newToken = generate_token(orderNumber)
-
-        # Update the order in MongoDB with the new token
-        update_result = ordersCollection.update_one({"_id": orderNumber}, {"$set": {"order_token": newToken}})
-        
-        # If no documents were updated, return an error
-        if update_result.matched_count == 0:
-            return jsonify({"error": "Order not found. Please check the order number and try again."}), 404
-
-        # Fetch the order data
-        raw_order_data = get_order_data(orderNumber, {})
-        if not raw_order_data:
-            return jsonify({"error": "If the details provided are correct, you will receive a link shortly."}), 404
-
-        orderData = json.loads(raw_order_data)
-        emailFromOrder = orderData.get("customer", {}).get("emailAddress")
-        
-        # Check if the email is present in the order data
-        if not emailFromOrder:
-            return jsonify({"error": "We encountered an issue retrieving your order information. Please try again later."}), 500
-
-        # Validate email with the one provided
-        if email != emailFromOrder:
-            return jsonify({"error": "The provided email does not match the one used during checkout. Please check and try again."}), 400
-
-        # Prepare email payload for sending
-        email_payload = {
-            "sender": "noreply@jesus-shirt-project.shop",
-            "recipients": [email],
-            "template_id": "8449130",
-            "template_data": {
-                "product_name": "Jesus-Shirt-Project",
-                "orders_url": f'{website_domain}/orders/{orderData["order_number"]}?order_token={orderData["order_token"]}',
-                "payment": orderData["payment_id"],
-                "shipping": orderData["shipping_cost"],
-                "email": emailFromOrder,
-                "address_line_name": orderData["customer"]["name"],
-                "address_line_street": orderData["shipping_address"]["line1"],
-                "address_line_city": orderData["shipping_address"]["city"],
-                "address_line_state_country": f'{orderData["shipping_address"]["state"]}, {orderData["shipping_address"]["country"]}',
-                "order_id": orderData["_id"],
-                "items": orderData["order_items"],
-                "total": orderData["total_price"],
-            },
-        }
-
-        # Send the email
-        
-        emailRes = handle_send_email(smtp2GoClient, email_payload)
-        
-        # Check if the email was sent successfully
-        if emailRes.get("status") != "success":
-            return jsonify({"error": "We couldn't send the email at this time. Please try again later."}), 500
-
-        return jsonify({"message": "A new order link has been sent to your email."}), 200
-
-    except KeyError as e:
-        return jsonify({"error": f"Missing required field: {str(e)}. Please try again later."}), 400
-    except Exception as e:
-        print(e)
-        return jsonify({"error": f"An unexpected error occurred. Please try again later."}), 500
 
 def handle_payment_intent_succeeded(payment_intent):
     print("PI metadata:", payment_intent["metadata"])
