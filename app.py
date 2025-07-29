@@ -15,6 +15,7 @@ import random
 import string
 import traceback
 import os
+import threading
 from smtp2go.core import Smtp2goClient
 import os
 from validators import validate_fields
@@ -1261,11 +1262,7 @@ def stripe_webhook():
     # Handle the checkout.session.completed event
     if event["type"] == "payment_intent.succeeded":
         payment_intent = event["data"]["object"]  # contains a stripe.PaymentIntent
-        res = handle_payment_intent_succeeded(payment_intent)
-        if "error" in res:
-            print("Order was successful.")
-        else:
-            print("Order was not successful")
+        threading.Thread(target=handle_payment_intent_succeeded, args=(payment_intent,)).start()
 
     return "Success", 200
 
