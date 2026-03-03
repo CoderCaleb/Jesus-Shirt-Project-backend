@@ -1317,25 +1317,29 @@ def get_orders():
 @app.route('/send-dify-chat-message', methods=['POST'])
 def send_dify_chat_message():
     DIFY_API_URL = f"{dify_domain}/v1/chat-messages"
-    user_id, session = get_session_and_user_id(request)
 
     # Get the user ID and other inputs from the request body
     query = request.json.get('query')
     inputs = request.json.get('inputs', {}) ## to pass jwt
     conversation_id = request.json.get('conversation_id',"")
 
-    # Add the access_token to the inputs
-    if user_id != None and session != None:
-        inputs['access_token'] = generate_jwt(user_id)
     print("Inputs",inputs)
     # Prepare the request payload
+    user_id = request.json.get('user_id', None)
+    if(user_id == None):
+        user_id, session = get_session_and_user_id(request)
+        # Add the access_token to the inputs
+        if user_id != None and session != None:
+            inputs['access_token'] = generate_jwt(user_id)
+        else:
+            user_id = generate_guest_uid()
     payload = {
         "query": query,
         "inputs": inputs,
         "response_mode": "blocking",
-        "user": generate_guest_uid() if not user_id else user_id,
-        "conversation_id": conversation_id,
-    }
+        "user": user_id,
+        "conversation_id": conversation_id.strip() if conversation_id != None else None,
+    } 
     
     print("Payload:",payload)
 
@@ -1352,7 +1356,7 @@ def send_dify_chat_message():
         if response.status_code == 200:
             data = response.json()
             print(data["answer"])
-            return jsonify({"answer":data["answer"],"conversation_id":data["conversation_id"]}), 200  # Return the response from the Dify API
+            return jsonify({"answer":data["answer"],"conversation_id":data["conversation_id"],"user_id":user_id}), 200  # Return the response from the Dify API
         else:
             print(response.text)
             return jsonify({"error": "Failed to send message"}), response.status_code
@@ -1387,6 +1391,9 @@ def get_connection_details():
         # Generate participant identity and room name
         guest_participant_identity = f"guest_user_{random.randint(0, 9999)}"
         room_name = f"voice_assistant_room_{random.randint(0, 9999)}"
+        
+        print("type of timedelta in get()", type(timedelta(seconds=900)))
+
 
         # Generate participant token
         participant_token = create_participant_token({"identity": user_id if user_id else guest_participant_identity}, room_name, short_lived_jwt)
@@ -1398,6 +1405,7 @@ def get_connection_details():
             "participantToken": participant_token,
             "participantName": user_id if user_id else guest_participant_identity,
         }
+        print(data)
         return jsonify(data), 200
 
     except Exception as e:
@@ -1408,11 +1416,13 @@ def create_participant_token(user_info, room_name, short_lived_jwt):
     API_KEY = os.getenv("LIVEKIT_API_KEY")
     API_SECRET = os.getenv("LIVEKIT_API_SECRET")
     try:
+        print("type of timedelta", type(timedelta(seconds=900)))
+
         token = api.AccessToken(API_KEY, API_SECRET) \
         .with_identity(user_info.get("identity", "default_identity")) \
-        .with_ttl(timedelta(seconds=900))  \
+        .with_ttl(ttl=900)  \
         .with_metadata(json.dumps({"access_token":short_lived_jwt})) \
-
+            
         # Add video grants
         grants = api.VideoGrants(
             room=room_name,
@@ -1422,8 +1432,6 @@ def create_participant_token(user_info, room_name, short_lived_jwt):
             can_subscribe=True
         )
         token.with_grants(grants)
-        print("Livekit token",token)
-        print("Livekit token",token, "Livekit JWT", token.to_jwt())
 
         return token.to_jwt()
     except Exception as e:
