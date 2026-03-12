@@ -18,12 +18,15 @@ import os
 import threading
 from smtp2go.core import Smtp2goClient
 import os
+from order_generator import generate_order
 from validators import validate_fields
 from supertokens_python.recipe.session.syncio import get_session
 import jwt
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv, dotenv_values 
 from livekit import api
+
+from order_generator import generate_sequential_order_number, generate_unique_suffix
 
 load_dotenv() 
 from supertokens_python import init, InputAppInfo, SupertokensConfig
@@ -64,7 +67,8 @@ def custom_email_deliver(original_implementation: EmailDeliveryOverrideInput) ->
         order_id = request.get_header("orderNumber")
         state = request.get_header("state")
         order_token = request.get_header("Order-Token")
-        print("Order headers", order_id, order_token)
+        role = request.get_header("role")
+        print("Order headers", order_id, order_token, role)
 
         parsed_url = urlparse(template_vars.url_with_link_code)
         query_params = parse_qs(parsed_url.query)
@@ -75,6 +79,8 @@ def custom_email_deliver(original_implementation: EmailDeliveryOverrideInput) ->
             query_params["state"] = state
         if order_token:
             query_params["order_token"] = order_token
+        if role:
+            query_params["role"] = role    
 
         updated_query = urlencode(query_params, doseq=True)
         updated_url = urlunparse(parsed_url._replace(query=updated_query))
@@ -148,8 +154,9 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
             request = get_request_from_user_context(user_context=user_context)
             order_id = request.get_header("orderNumber")
             state = request.get_header("state").strip() if request.get_header("state") else None
+            role = request.get_header("role")
             order_token = request.get_header("Order-Token")
-            print(order_id, state, order_token, "consume code headers")
+            print(order_id, state, order_token, role, "consume code headers")
 
             if not user:
                 raise ValueError("User is not found")
@@ -159,11 +166,30 @@ def override_passwordless_functions(original_implementation: RecipeInterface):
             def callback(mongo_session):
                 if result.created_new_recipe_user:
                     try:
-                        usersCollection.insert_one(
-                            {"uid": uid, "email": user.emails[0]},
-                            session=mongo_session,
-                        )
+                        user_doc = {
+                            "uid": uid,
+                            "email": user.emails[0],
+                        }
+
+                        if role == "tester":
+                            user_doc["orders"] = []
+
+                        usersCollection.insert_one(user_doc, session=mongo_session)
+                        
+                        if role == "tester":
+                            inserted_orders = []
+                        
+                            for _ in range(3):
+                                order = generate_order(ordersCollection, linked_user=uid, session=mongo_session)
+                                inserted_result = ordersCollection.insert_one(order, session=mongo_session)
+                                inserted_orders.append(inserted_result.inserted_id)
+                            usersCollection.update_one(
+                                {"uid": uid},
+                                {"$push": {"orders": {"$each": inserted_orders}}},
+                                session=mongo_session
+                            )
                     except Exception as e:
+                        print("sign up mongo error",e)
                         raise ValueError("Failed to insert user data into MongoDB")
 
                 print(state in ["valid_token_unauthenticated_no_linked_user", "valid_token_authenticated_no_linked_user"], "state check for order", state, type(state))
@@ -331,7 +357,7 @@ CORS(
         }
     },
     supports_credentials=True,  # Required for SuperTokens sessions (cookies)
-    allow_headers=["Content-Type","Order-Token","orderNumber","state","Access-Token"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
+    allow_headers=["Content-Type","Order-Token","orderNumber","state","Access-Token", "role"] + get_all_cors_headers(),  # Enable headers required by the frontend and SuperTokens
 )
 
 print(website_domain, api_domain)
@@ -407,43 +433,18 @@ def calculate_order_amount(items):
     return int(total_price * 100)
 
 
-def generate_unique_suffix(length=4):
-    # Generate a unique alphanumeric suffix
-    return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
-
-
-def generate_sequential_order_number(last_order_number):
-    print("Last order number:", last_order_number)
-
-    if not last_order_number:
-        return "ORD00001" + generate_unique_suffix()
-
-    # Extract the numeric part by removing non-digit characters
-    numeric_part = int("".join(filter(str.isdigit, last_order_number)))
-
-    # Increment the numeric part to get the next order number
-    next_numeric_part = numeric_part + 1
-
-    # Combine the prefix "ORD" with the incremented numeric part, formatted to 5 digits
-    next_order_number = (
-        "ORD" + str(next_numeric_part).zfill(5) + generate_unique_suffix()
-    )
-
-    return next_order_number
-
-
-def generate_jwt(user_id):
+def generate_jwt(user_id, exp_time_in_sec=30):
     """
     Generate a JWT for the user.
     """
     now = datetime.now(timezone.utc)
     payload = {
         'user_id': user_id,
-        'exp': int((now + timedelta(minutes=15)).timestamp()),
+        'exp': int((now + timedelta(seconds=exp_time_in_sec)).timestamp()),
         'iat': int(now.timestamp())
     }
     print("now type:", type(now), "value:", now)
-    print("timedelta type:", type(timedelta(minutes=15)), "value:", timedelta(minutes=15))
+    print("timedelta type:", type(timedelta(seconds=30)), "value:", timedelta(minutes=15))
 
     result = now + timedelta(minutes=15)
     print("result type:", type(result), "value:", result)
@@ -529,7 +530,7 @@ def authenticate_order_token(f):
             try:
                 order_data = json.loads(get_order_data(order_id, None))
                 if not order_data:
-                    return jsonify({"error":"Failed to fetch order token"}), 400
+                    return jsonify({"error":"Failed to fetch order"}), 400
                 order_token_from_db = order_data.get("order_token",None) if order_data else None
                 print("order_token_from_db:", order_token_from_db, "order_token_from_frontend:",order_token)
                 if order_data and order_token_from_db == order_token:
@@ -1028,6 +1029,7 @@ def get_order():
         
         # Order token verification
         orderInfo = g.get("order_info", None)
+
         order_token_verified = (
             "no-token-provided" if orderInfo == "no-token-provided"
             else "token-invalid" if orderInfo == "token-invalid"
@@ -1330,7 +1332,7 @@ def send_dify_chat_message():
         user_id, session = get_session_and_user_id(request)
         # Add the access_token to the inputs
         if user_id != None and session != None:
-            inputs['access_token'] = generate_jwt(user_id)
+            inputs['access_token'] = generate_jwt(user_id, 30)
         else:
             user_id = generate_guest_uid()
     payload = {
@@ -1377,7 +1379,7 @@ def get_connection_details():
         short_lived_jwt = None
         
         if user_id != None and session != None:
-            short_lived_jwt = generate_jwt(user_id)
+            short_lived_jwt = generate_jwt(user_id, 900)
             
         print("short lived jwt",short_lived_jwt)    
 
@@ -1393,7 +1395,6 @@ def get_connection_details():
         room_name = f"voice_assistant_room_{random.randint(0, 9999)}"
         
         print("type of timedelta in get()", type(timedelta(seconds=900)))
-
 
         # Generate participant token
         participant_token = create_participant_token({"identity": user_id if user_id else guest_participant_identity}, room_name, short_lived_jwt)
@@ -1420,7 +1421,7 @@ def create_participant_token(user_info, room_name, short_lived_jwt):
 
         token = api.AccessToken(API_KEY, API_SECRET) \
         .with_identity(user_info.get("identity", "default_identity")) \
-        .with_ttl(ttl=900)  \
+        .with_ttl(ttl=timedelta(seconds=900))  \
         .with_metadata(json.dumps({"access_token":short_lived_jwt})) \
             
         # Add video grants
